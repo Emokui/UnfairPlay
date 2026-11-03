@@ -4,11 +4,19 @@
 
 ## 下载与安装
 
-从 [Releases](https://github.com/Emokui/UnfairPlay/releases/latest) 下载 **UnfairPlay-1.3.0.dmg**，打开后将 **UnfairPlay** 拖入 **Applications**。
+从 [Releases](https://github.com/Emokui/UnfairPlay/releases/latest) 下载 **UnfairPlay-1.3.3.dmg**，打开后将 **UnfairPlay** 拖入 **Applications**。
 
 - Apple 芯片 Mac，macOS **27.0 或更新版本**。
 - 本版本为 ad-hoc 签名，未经过 Apple 开发者证书签名或公证。
 - 不需要另外安装 Go。已有账户和模型可继续使用。
+
+## 1.3.3 更新
+
+- 保存失败时可直接另存，无需重新下载或解密；支持跨磁盘保存，复制在后台执行。
+- 修复普通权限模型文件的导入；导入后在私有目录完整校验。
+- 登录失败可继续原档案，重复添加待登录 ID 自动复用。
+- 底部状态栏显示认证阶段和输入提示，点击工作区自动收起操作记录。
+- 首次认证组件提取提速并复用缓存；构建默认从固定源码编译，补齐第三方许可。
 
 ## 功能
 
@@ -31,15 +39,13 @@
 
 ## 源码
 
-[1.3.0 完整源码包](https://github.com/Emokui/UnfairPlay/releases/download/v1.3.0/UnfairPlay-1.3.0-source.zip) 包含 SwiftUI 界面、C 进程工具、测试、图标、构建脚本和修改后的 Go 依赖源码，不包含账户、模型或构建缓存。
+[1.3.3 完整源码包](https://github.com/Emokui/UnfairPlay/releases/download/v1.3.3/UnfairPlay-1.3.3-source.zip) 包含 SwiftUI 界面、C 进程工具、测试、图标、构建脚本和修改后的 Go 依赖源码，不包含账户、模型或构建缓存。
 
 解压后，在 `UnfairPlayDesk` 目录构建。需要 Xcode Command Line Tools 和 Go 1.25 或更新版本：
 
 ```sh
-mkdir -p Tools
-(cd Vendor/unfairplay && go build -o ../../Tools/unfairplay ./cmd/unfairplay)
 chmod +x build.sh test.sh package-dmg.sh
-./build.sh ./Tools
+./build.sh
 ./test.sh
 ./package-dmg.sh
 ```
