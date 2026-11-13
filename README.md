@@ -43,14 +43,13 @@
 
 账户和模型的管理操作在各自卡片右上角的 **…** 菜单中。
 
-## 源码
+## 源码与构建
 
-仓库根目录提供 [`UnfairPlay-1.4.0-source.zip`](UnfairPlay-1.4.0-source.zip)，也可从 [1.4.0 Releases](https://github.com/Emokui/UnfairPlay/releases/tag/v1.4.0) 下载。源码包包含 SwiftUI 界面、C 进程工具、测试、图标、构建脚本和修改后的 Go 依赖源码；不包含账户、模型或构建缓存。
+完整可编译源码直接位于仓库的 [UnfairPlayDesk/](UnfairPlayDesk/) 文件夹中，包含 SwiftUI 界面、C 进程工具、测试、图标、构建脚本和完整 Go 依赖源码；账户、模型和构建缓存不包含在内。源码 ZIP 也可从 [1.4.0 Releases](https://github.com/Emokui/UnfairPlay/releases/tag/v1.4.0) 下载。
 
-解压后，在 `UnfairPlayDesk` 目录运行以下命令。需要 Xcode Command Line Tools 和 Go 1.25 或更新版本：
+克隆仓库后，在项目目录运行以下命令。需要 Xcode Command Line Tools 和 Go 1.25 或更新版本：
 
 ```sh
-unzip UnfairPlay-1.4.0-source.zip
 cd UnfairPlayDesk
 chmod +x build.sh test.sh package-dmg.sh
 ./build.sh
@@ -58,11 +57,11 @@ chmod +x build.sh test.sh package-dmg.sh
 ./package-dmg.sh
 ```
 
-模型校验器使用与已验证引擎一致的上游版本 `41f064bfe0ef947e748b785b8ab62697a64bdbe6`。源码包内的 `README.md` 包含实现、验证记录与限制说明。
+模型校验器使用与已验证引擎一致的上游版本 `41f064bfe0ef947e748b785b8ab62697a64bdbe6`。项目目录中的 `README.md` 包含实现、验证记录与限制说明。
 
 ## 致谢与许可
 
 - [DrWhax/unfairplay](https://github.com/DrWhax/unfairplay)：核心模型与 IPA 处理工具。
 - [majd/ipatool](https://github.com/majd/ipatool)：App Store 下载与账户操作。
 
-第三方许可证和声明保留在源码包的 `Licenses/` 与对应 `Vendor/` 目录，以及应用包的 `Contents/Resources/Licenses/` 中。
+第三方许可证和声明保留在项目的 `Licenses/` 与对应 `Vendor/` 目录，以及应用包的 `Contents/Resources/Licenses/` 中。
