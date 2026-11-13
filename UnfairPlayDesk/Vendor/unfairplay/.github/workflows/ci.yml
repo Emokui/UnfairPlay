@@ -1,0 +1,51 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go generate ./tools/compact-kernel && git diff --exit-code
+      - run: go test ./...
+      - run: go vet ./...
+
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            extension: ""
+          - os: linux
+            arch: arm64
+            extension: ""
+          - os: darwin
+            arch: arm64
+            extension: ""
+          - os: windows
+            arch: amd64
+            extension: .exe
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: |
+          mkdir -p dist
+          go build -trimpath -o "dist/unfairplay-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.extension }}" ./cmd/unfairplay
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
