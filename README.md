@@ -1,6 +1,6 @@
 <p align="center"><img src="AppIcon.png" width="112" alt="UnfairPlay icon"></p>
 <h1 align="center">UnfairPlay</h1>
-<p align="center">简洁的原生 macOS IPA 工作台</p>
+<p align="center">简洁的原生 macOS IPA 静态脱壳工具</p>
 
 ## 下载与安装
 
