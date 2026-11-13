@@ -1,0 +1,7 @@
+/unfairplay
+/dist/
+*.decrypted.ipa
+*.decrypted.json
+*.capture/
+*.recovery/
+fairplay-enrollment.bin
