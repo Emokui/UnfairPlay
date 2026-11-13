@@ -14,7 +14,7 @@
 
 - 工具启动前的签名校验移至后台并在进程内复用；模型导入、回收和账户文件清理在后台执行，界面保持响应。
 - 下载缺少许可的免费应用时，会自动尝试获取许可；已有许可的免费和付费应用直接下载。不会自动购买付费应用。
-- 优化 Apple 账户登录、认证组件缓存、IPA 下载、模型校验和解密性能，并改进任务进度显示。
+- 修复登录认证、下载 IPA、认证组件缓存与解密/模型验证性能，改进任务阶段进度显示。
 
 ## 1.3.3 更新
 
@@ -45,18 +45,20 @@
 
 ## 源码
 
-[1.4.0 完整源码包](https://github.com/Emokui/UnfairPlay/releases/download/v1.4.0/UnfairPlay-1.4.0-source.zip) 包含 SwiftUI 界面、C 进程工具、测试、图标、构建脚本和修改后的 Go 依赖源码，不包含账户、模型或构建缓存。
+仓库根目录提供 [`UnfairPlay-1.4.0-source.zip`](UnfairPlay-1.4.0-source.zip)，也可从 [1.4.0 Releases](https://github.com/Emokui/UnfairPlay/releases/tag/v1.4.0) 下载。源码包包含 SwiftUI 界面、C 进程工具、测试、图标、构建脚本和修改后的 Go 依赖源码；不包含账户、模型或构建缓存。
 
-解压后，在 `UnfairPlayDesk` 目录构建。需要 Xcode Command Line Tools 和 Go 1.25 或更新版本：
+解压后，在 `UnfairPlayDesk` 目录运行以下命令。需要 Xcode Command Line Tools 和 Go 1.25 或更新版本：
 
 ```sh
+unzip UnfairPlay-1.4.0-source.zip
+cd UnfairPlayDesk
 chmod +x build.sh test.sh package-dmg.sh
 ./build.sh
 ./test.sh
 ./package-dmg.sh
 ```
 
-模型校验器使用与已验证引擎一致的上游版本 `41f064bfe0ef947e748b785b8ab62697a64bdbe6`。源码包内 README 包含实现、验证记录与限制说明。
+模型校验器使用与已验证引擎一致的上游版本 `41f064bfe0ef947e748b785b8ab62697a64bdbe6`。源码包内的 `README.md` 包含实现、验证记录与限制说明。
 
 ## 致谢与许可
 
