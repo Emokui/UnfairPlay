@@ -88,6 +88,7 @@ func NewAppStore(args Args) AppStore {
 	authHTTP := storeauth.NewHTTPClient(args.CookieJar)
 	clientArgs := http.Args{
 		CookieJar: args.CookieJar,
+		Timeout:   http.DefaultAuthenticationTimeout,
 		Executor:  backend.Client("request"),
 	}
 
@@ -101,7 +102,7 @@ func NewAppStore(args Args) AppStore {
 		keychain:               args.Keychain,
 		loginClient:            http.NewClient[loginResult](http.Args{CookieJar: args.CookieJar, Authentication: true, Executor: backend.Client("authenticate")}),
 		searchClient:           http.NewClient[searchResult](clientArgs),
-		purchaseClient:         http.NewClient[purchaseResult](http.Args{CookieJar: args.CookieJar, Executor: backend.Client("purchase")}),
+		purchaseClient:         http.NewClient[purchaseResult](http.Args{CookieJar: args.CookieJar, Timeout: http.DefaultAuthenticationTimeout, Executor: backend.Client("purchase")}),
 		downloadClient:         http.NewClient[downloadResult](clientArgs),
 		kbsyncGenerator:        defaultKBSyncGenerator,
 		platformClient:         http.NewClient[platformVersionLookupResult](clientArgs),
@@ -111,7 +112,6 @@ func NewAppStore(args Args) AppStore {
 		httpClient:             http.NewClient[interface{}](http.Args{CookieJar: args.CookieJar, Executor: backend.Client("transfer")}),
 		macDecrypterFactory:    defaultMacPackageDecrypterFactory,
 		actionSignerFactory:    actionSignerFactory,
-		authRetrySleep:         time.Sleep,
 		machine:                args.Machine,
 		os:                     args.OperatingSystem,
 		authBackend:            backend,

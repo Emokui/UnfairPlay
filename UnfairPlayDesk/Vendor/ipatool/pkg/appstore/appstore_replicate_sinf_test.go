@@ -78,10 +78,6 @@ var _ = Describe("AppStore (ReplicateSinf)", func() {
 				DoAndReturn(os.OpenFile)
 
 			mockOS.EXPECT().
-				Remove(testFile.Name()).
-				Return(nil)
-
-			mockOS.EXPECT().
 				Rename(fmt.Sprintf("%s.tmp", testFile.Name()), testFile.Name()).
 				Return(nil)
 
@@ -140,10 +136,6 @@ var _ = Describe("AppStore (ReplicateSinf)", func() {
 			mockOS.EXPECT().
 				OpenFile(gomock.Any(), gomock.Any(), gomock.Any()).
 				DoAndReturn(os.OpenFile)
-
-			mockOS.EXPECT().
-				Remove(testFile.Name()).
-				Return(nil)
 
 			mockOS.EXPECT().
 				Rename(fmt.Sprintf("%s.tmp", testFile.Name()), testFile.Name()).

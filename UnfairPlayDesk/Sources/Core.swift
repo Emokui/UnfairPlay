@@ -26,6 +26,31 @@ enum Core {
                          modifiedSeconds: info.st_mtimespec.tv_sec, modifiedNanos: info.st_mtimespec.tv_nsec,
                          changedSeconds: info.st_ctimespec.tv_sec, changedNanos: info.st_ctimespec.tv_nsec)
     }
+    static func isMissingFile(_ url: URL) -> Bool {
+        var info = stat()
+        if fstatat(AT_FDCWD, url.path, &info, 0) == 0 {
+            return info.st_mode & S_IFMT != S_IFREG
+        }
+        // Keep references when macOS denies access instead of reporting a missing file.
+        return errno == ENOENT || errno == ENOTDIR
+    }
+    static func recycleIPAs(_ files: [URL]) -> (removed: Set<String>, failures: [String]) {
+        var removed = Set<String>()
+        var failures: [String] = []
+        for file in files {
+            if !isMissingFile(file) {
+                do { try FileManager.default.trashItem(at: file, resultingItemURL: nil) }
+                catch {
+                    if !isMissingFile(file) {
+                        failures.append("\(file.lastPathComponent) — \(error.localizedDescription)")
+                        continue
+                    }
+                }
+            }
+            removed.insert(file.standardizedFileURL.path)
+        }
+        return (removed, failures)
+    }
     struct OutputTarget {
         let url: URL
         let original: FileStamp?
@@ -215,18 +240,60 @@ enum Core {
         }
         return nil
     }
+    static func storeFront(in output: String) -> String? {
+        for line in output.components(separatedBy: .newlines).reversed() {
+            guard let start = line.firstIndex(of: "{"), let data = String(line[start...]).data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  json["success"] as? Bool == true, json["email"] is String,
+                  let value = json["storeFront"] as? String else { continue }
+            return value
+        }
+        return nil
+    }
+    static func operationError(title: String, hint: String?, output: String) -> String {
+        let detail = output.components(separatedBy: .newlines).reversed().lazy.compactMap { line -> String? in
+            if let start = line.firstIndex(of: "{"),
+               let json = try? JSONSerialization.jsonObject(with: Data(line[start...].utf8)) as? [String: Any],
+               let error = json["error"] as? String { return error }
+            let text = line.trimmingCharacters(in: .whitespaces)
+            return text.lowercased().hasPrefix("error:") ? String(text.dropFirst(6)).trimmingCharacters(in: .whitespaces) : nil
+        }.first
+        return [title + "：未完成", hint, detail.map { String($0.prefix(650)) }]
+            .compactMap { $0 }.joined(separator: "\n\n")
+    }
+    static func isMissingSession(in lowercaseError: String) -> Bool {
+        (lowercaseError.contains("keyring") || lowercaseError.contains("failed to get account")) &&
+            (lowercaseError.contains("not be found") || lowercaseError.contains("not found") || lowercaseError.contains("no such file"))
+    }
     static func errorHint(_ text: String) -> String {
         let value = text.lowercased()
+        if value.contains("free app license rejected after sign-in refresh") { return "Apple 在重新验证后仍未发放免费许可。请先用同一个 Apple ID 在 App Store 点「获取」，再回来下载。" }
         if value.contains("unsupported") && (value.contains("build") || value.contains("fairplay")) { return "当前系统构建暂未受内置工具支持，请升级工具后再初始化；不要放宽校验或强行生成模型。" }
         if value.contains("license is required") { return "当前 ID 尚未取得此应用许可。若自动获取未成功，请用此 ID 在 App Store 获取或购买应用后重试，无需清除登录。" }
-        if value.contains("password token") || value.contains("token expired") || value.contains("session expired") { return "登录会话已过期，请清除此账户登陆后重新登录。" }
-        if (value.contains("keyring") || value.contains("failed to get account")) && (value.contains("not be found") || value.contains("not found") || value.contains("no such file")) { return "这个账户档案尚未登录，请先登录此 ID。" }
+        if value.contains("deadline exceeded") || value.contains("client.timeout") || value.contains("i/o timeout") { return "Apple 接口响应超时，请重试。" }
+        if value.contains("download received no data") { return "下载连接长时间没有收到数据，续传仍未成功，请重试。" }
+        if value.contains("download account does not match") { return "下载会话与所选账户不一致，请在账户操作菜单重新登录。" }
+        if value.contains("incorrect apple account or password") { return "Apple 拒绝了账号或密码，请核对后重试。" }
+        if value.contains("apple did not confirm sign-in") { return "请核对 Apple 账户和密码。收到本次登录的验证码后，可以选择继续验证。" }
+        if value.contains("apple did not accept the password and verification code") { return "请核对密码和本次登录的六位验证码，再重新登录。" }
+        if value.contains("auth code is required") { return "Apple 要求重新验证，请在账户操作菜单选择继续登录。" }
+        if value.contains("password token") || value.contains("token expired") || value.contains("session expired") { return "登录会话已过期，请在账户操作菜单选择继续登录。" }
+        if isMissingSession(in: value) { return "这个账户档案尚未登录，请先登录此 ID。" }
         if value.contains("keychain passphrase") { return "需要解锁此账户的加密凭据库。请按提示输入解锁口令，它与 Apple ID 密码不同。" }
         if value.contains("authcode") || value.contains("2fa") || value.contains("verification") { return "需要验证 Apple 账户，请按提示输入验证码；若操作已结束，请重新登录。" }
         if value.contains("permission denied") || value.contains("operation not permitted") { return "文件或授权状态不可读取。请检查文件所有者、私有权限，以及系统授权是否完成。" }
         if value.contains("selector") || value.contains("enrollment") && value.contains("match") { return "IPA 与所选模型的账户授权状态不匹配，请选择对应账户的模型和 IPA。" }
         if value.contains("model") { return "模型缺失、无效或与 IPA 不匹配，请查看模型状态并重新校验、导入或初始化。" }
         if value.contains("authorization") || value.contains("授权") { return "管理员授权未完成，请重试初始化；取消授权不会生成新模型。" }
-        return "操作未完成，请查看下方具体错误后重试。"
+        return "请检查所选文件或账户后重试。"
+    }
+    static func isFilePermissionError(_ error: Error) -> Bool {
+        let cause = error as NSError
+        if cause.domain == NSPOSIXErrorDomain { return cause.code == Int(EPERM) || cause.code == Int(EACCES) }
+        if cause.domain == NSCocoaErrorDomain && cause.code == NSFileReadNoPermissionError { return true }
+        if let underlying = cause.userInfo[NSUnderlyingErrorKey] as? Error {
+            return isFilePermissionError(underlying)
+        }
+        return false
     }
 }

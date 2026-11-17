@@ -3,6 +3,7 @@ package cmd
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/avast/retry-go"
@@ -62,9 +63,9 @@ func loginCmd() *cobra.Command {
 
 			// nolint:wrapcheck
 			return retry.Do(func() error {
-				if errors.Is(lastErr, appstore.ErrAuthCodeRequired) && interactive {
+				if interactive && canProvideVerificationCode(lastErr) {
 					var err error
-					authCode, err = readPrompt("enter 2FA code: ", false)
+					authCode, err = readVerificationCode(lastErr)
 					if err != nil {
 						return fmt.Errorf("failed to read auth code: %w", err)
 					}
@@ -76,6 +77,7 @@ func loginCmd() *cobra.Command {
 					Msg("logging in")
 
 				output, err := dependencies.AppStore.Login(appstore.LoginInput{
+					Context:  cmd.Context(),
 					Email:    email,
 					Password: password,
 					AuthCode: authCode,
@@ -93,6 +95,7 @@ func loginCmd() *cobra.Command {
 				dependencies.Logger.Log().
 					Str("name", output.Account.Name).
 					Str("email", output.Account.Email).
+					Str("storeFront", output.Account.StoreFront).
 					Bool("success", true).
 					Send()
 
@@ -105,7 +108,7 @@ func loginCmd() *cobra.Command {
 				retry.RetryIf(func(err error) bool {
 					lastErr = err
 
-					return errors.Is(err, appstore.ErrAuthCodeRequired)
+					return interactive && authCode == "" && canProvideVerificationCode(err)
 				}),
 			)
 		},
@@ -116,6 +119,22 @@ func loginCmd() *cobra.Command {
 	cmd.Flags().StringVar(&authCode, "auth-code", "", "2FA code for the Apple ID")
 
 	return cmd
+}
+
+func canProvideVerificationCode(err error) bool {
+	return errors.Is(err, appstore.ErrAuthCodeRequired) || errors.Is(err, appstore.ErrAuthenticationAmbiguous)
+}
+
+func readVerificationCode(loginErr error) (string, error) {
+	prompt := "enter 2FA code: "
+	if errors.Is(loginErr, appstore.ErrAuthenticationAmbiguous) {
+		prompt = "Apple could not confirm sign-in. If you received a code, enter it or leave blank: "
+	}
+	code, err := readPrompt(prompt, false)
+	if err == nil && strings.TrimSpace(code) == "" {
+		return "", loginErr
+	}
+	return code, err
 }
 
 // nolint:wrapcheck
@@ -132,6 +151,7 @@ func infoCmd() *cobra.Command {
 			dependencies.Logger.Log().
 				Str("name", output.Account.Name).
 				Str("email", output.Account.Email).
+				Str("storeFront", output.Account.StoreFront).
 				Bool("success", true).
 				Send()
 

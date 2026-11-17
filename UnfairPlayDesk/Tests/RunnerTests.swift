@@ -19,9 +19,9 @@ import Darwin
         try data.write(to: url)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }
-    @MainActor static func waitUntil(_ condition: () -> Bool) async {
+    @MainActor static func waitUntil(_ message: String = "timed out", _ condition: () -> Bool) async {
         for _ in 0..<150 { if condition() { return }; try? await Task.sleep(nanoseconds: 100_000_000) }
-        preconditionFailure("timed out")
+        preconditionFailure(message)
     }
     @MainActor static func main() async throws {
         setbuf(stdout, nil)
@@ -41,6 +41,44 @@ import Darwin
         precondition(Core.appID("https://apps.apple.com/jp/app/test/id6474479684?l=ja") == "6474479684")
         precondition(Core.appID("6474479684") == "6474479684")
         precondition(Core.appID("https://evil.example/id123") == nil && Core.appID("0") == nil)
+        let history = try CatalogService.parseHistory(Data(#"[{"external_identifier":868540902,"bundle_version":"1.2.9"},{"external_identifier":"868540902","bundle_version":"duplicate"},{"external_identifier":"12x","bundle_version":"invalid"},{"versionId":"868540901","version":"1.2.8"}]"#.utf8))
+        precondition(history.map(\.id) == ["868540902", "868540901"])
+        precondition(history.first?.version == "1.2.9")
+        let wrapped = try CatalogService.parseHistory(Data(#"{"data":[{"version_id":"123","version":"2.0","date":"2024-01-01"}]}"#.utf8))
+        precondition(wrapped.first?.date == "2024-01-01")
+        precondition(DownloadCatalog.country(forStoreFront: "143462-1,32") == "JP")
+        precondition(DownloadCatalog.country(forStoreFront: " 143465,29 ") == "CN")
+        precondition(DownloadCatalog.country(forStoreFront: "143443") == "DE")
+        precondition(DownloadCatalog.country(forStoreFront: "143444") == "GB")
+        precondition(DownloadCatalog.country(forStoreFront: "143463") == "HK")
+        precondition(DownloadCatalog.country(forStoreFront: "143470") == "TW")
+        precondition(DownloadCatalog.country(forStoreFront: "143466") == "KR")
+        precondition(DownloadCatalog.country(forStoreFront: nil) == "US")
+        precondition(DownloadCatalog.country(forStoreFront: "143442") == "FR")
+        precondition(DownloadCatalog.country(forStoreFront: "unknown") == "US")
+        precondition(Core.storeFront(in: #"{"success":false,"email":"test@example.com","storeFront":"143462"}"#) == nil)
+        precondition(Core.storeFront(in: #"{"success":true,"email":"test@example.com","storeFront":"143462-1,32"}"#) == "143462-1,32")
+        let iosdump = try CatalogService.parseHistory(Data(#"{"code":200,"total":1,"data":[{"bundle_version":"1.4.2","external_identifier":894154892,"created_at":"2026-10-30 19:32:28"}]}"#.utf8))
+        precondition(iosdump.first?.id == "894154892" && iosdump.first?.version == "1.4.2")
+        precondition(VersionSource.allCases.map(\.rawValue) == ["Timbrd", "Bilin", "iOSDump"])
+        let catalog = DownloadCatalog()
+        catalog.selectApp("123"); catalog.selectedVersion = "456"
+        precondition(catalog.versionArguments == ["--external-version-id", "456"])
+        catalog.selectApp("789")
+        precondition(catalog.versionArguments.isEmpty && catalog.versions.isEmpty)
+        catalog.versions = iosdump
+        catalog.versionsLoaded = true
+        catalog.purchaseStatus["789"] = .owned
+        catalog.selectedVersion = "--output"
+        precondition(!catalog.validVersion)
+        catalog.changeAccount()
+        precondition(catalog.validVersion && catalog.selectedVersion.isEmpty)
+        precondition(catalog.versionsLoaded && catalog.versions.map(\.id) == iosdump.map(\.id) && catalog.purchaseStatus.isEmpty)
+        catalog.selectCountry("JP")
+        precondition(catalog.country == "JP" && catalog.versionsLoaded && catalog.versions.map(\.id) == iosdump.map(\.id))
+        let version = try DownloadCatalog.response(CatalogVersion.self, in: "progress\n" + #"{"externalVersionID":"123","displayVersion":"1.0","releaseDate":"2024-01-01T12:00:00Z"}"#)
+        precondition(version.displayVersion == "1.0" && version.dateText != nil)
+        print("PASS: version catalog formats, deduplication, app/account isolation, exact download version arguments and mixed CLI output")
         let runner = Runner()
         let unlaunched = root.appendingPathComponent("must-not-launch")
         let preparing = Runner(verify: { try await Task.sleep(nanoseconds: 150_000_000) })
@@ -64,21 +102,34 @@ import Darwin
         print("PASS: preparation remains tracked, cancellation prevents process launch, verification failure releases task and returns error")
         let ok = await withCheckedContinuation { continuation in
             runner.launch(URL(fileURLWithPath: "/bin/zsh"), ["-c", "printf 'password: '; read -r value; [[ $value == synthetic-secret ]] || exit 2; printf '\\naccepted\\n'"], title: "password") { continuation.resume(returning: $0) }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { runner.reply("synthetic-secret") }
+            Task { @MainActor in
+                await waitUntil("timed out waiting for the synthetic shell password prompt") {
+                    runner.inputPrompt == .password
+                }
+                runner.reply("synthetic-secret")
+            }
         }
         precondition(ok && runner.output.contains("accepted") && !runner.output.contains("synthetic-secret"))
         let goInput = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().appendingPathComponent("GoInputTest")
         let goInteraction = await withCheckedContinuation { continuation in
             runner.launch(goInput, [], title: "Go terminal input") { continuation.resume(returning: $0) }
             Task { @MainActor in
-                await waitUntil { runner.output.contains("password: ") }
+                await waitUntil("timed out waiting for the synthetic Go password prompt") {
+                    runner.inputPrompt == .password
+                }
+                precondition(runner.canReply)
                 runner.reply("synthetic-go-secret")
-                await waitUntil { runner.output.contains("enter 2FA code: ") }
+                precondition(!runner.canReply)
+                await waitUntil("timed out waiting for the synthetic 2FA prompt") {
+                    runner.inputPrompt == .verification
+                }
+                precondition(runner.canReply)
                 runner.reply("123456")
             }
         }
-        precondition(goInteraction && runner.output.contains("verification accepted"))
+        precondition(goInteraction && runner.output.contains("verification accepted") && !runner.canReply)
         precondition(!runner.output.contains("synthetic-go-secret") && !runner.output.contains("123456"))
+        print("PASS: synthetic 2FA prompt recognized, six-digit code accepted without echo")
         let chained = await withCheckedContinuation { continuation in
             runner.launch(URL(fileURLWithPath: "/usr/bin/true"), [], title: "first") { first in
                 precondition(first)
@@ -101,7 +152,7 @@ import Darwin
         precondition(runner.output == "中文")
         runner.log = ""; runner.currentLine = ""; runner.append("保留行\r"); runner.append("\n")
         precondition(runner.log == "保留行\n")
-        runner.append("enter password:"); precondition(runner.displayOutput.contains("请输入 Apple 账户密码"))
+        precondition(InputPrompt.match("enter password:") == .password)
         let created = root.appendingPathComponent("worker-created")
         let privateChild = await withCheckedContinuation { continuation in
             runner.launch(URL(fileURLWithPath: "/bin/zsh"), ["-c", ": > \"$1\"", "mode", created.path], title: "mode") { continuation.resume(returning: $0) }
@@ -238,12 +289,16 @@ import Darwin
 
         runner.append("{\"message\":\"正在与 Apple 建立认证连接\"}\n")
         precondition(runner.title == "正在与 Apple 建立认证连接")
+        runner.append("Apple could not confirm sign-in. If you received a code, enter it or leave blank: ")
+        precondition(runner.title == "等待确认登录")
+        precondition(InputPrompt.match(runner.currentLine) == .verificationChoice)
+        runner.append("\n")
         runner.append("enter 2FA code: ")
         precondition(runner.title == "等待输入双重认证验证码")
         runner.append("\n100%\n")
         precondition(runner.progress == 1)
-        runner.append("{\"message\":\"正在整理 IPA 与应用许可\",\"phase\":\"stage\"}\n")
-        precondition(runner.progress == nil)
+        runner.append("\rdownloading 100% || (100/100 B) {\"message\":\"正在整理 IPA 与应用许可\",\"phase\":\"stage\"}\n")
+        precondition(runner.progress == nil && runner.title == "正在整理 IPA 与应用许可")
         runner.append("{\"message\":\"正在解密并校验可执行镜像\",\"phase\":\"images\",\"completed\":2,\"total\":4}\n")
         precondition(runner.progress == 0.5)
         print("PASS: stage progress clears stale download percentage; image progress and auth prompts update correctly")
@@ -352,7 +407,17 @@ import Darwin
         try store.remove(pending)
         store.selected = b.id
         print("PASS: failed-login identity hint persists without binding, lookup reuses profile, verified identity replaces hint")
-        try store.bindIdentity(a.id, email: "Japan@Example.com")
+        try store.bindIdentity(a.id, email: "Japan@Example.com", storeFront: "143462-1,32")
+        precondition(store.profiles.first(where: { $0.id == a.id })?.storeFront == "143462-1,32")
+        try store.markLoginCleared(a.id)
+        precondition(store.profiles.first(where: { $0.id == a.id })?.loginCleared == true)
+        precondition(store.profiles.first(where: { $0.id == a.id })?.storeFront == nil)
+        precondition(store.profiles.first(where: { $0.id == a.id })?.appleID == "japan@example.com")
+        try store.bindIdentity(a.id, email: "Japan@Example.com", storeFront: "143465")
+        precondition(store.profiles.first(where: { $0.id == a.id })?.loginCleared == false)
+        let regionProfiles = try JSONDecoder().decode([Profile].self, from: Data(contentsOf: goodRoot.appendingPathComponent("profiles.json")))
+        precondition(regionProfiles.first(where: { $0.id == a.id })?.storeFront == "143465")
+        print("PASS: account storefront mapping, default US, persistent session region, logout clears region without unbinding identity, iOSDump schema")
         do { try store.bindIdentity(a.id, email: "different@example.com"); preconditionFailure("must reject wrong ID") } catch {}
         do { try store.bindIdentity(b.id, email: "japan@example.com"); preconditionFailure("must reject duplicate ID") } catch {}
         try store.markDeleting(a.id)

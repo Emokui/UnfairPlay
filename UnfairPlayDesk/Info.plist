@@ -4,12 +4,12 @@
 <key>CFBundleName</key><string>UnfairPlay</string>
 <key>CFBundleDisplayName</key><string>UnfairPlay</string>
 <key>CFBundleIdentifier</key><string>local.unfairplay.desk</string>
-<key>CFBundleVersion</key><string>22</string>
-<key>CFBundleShortVersionString</key><string>1.4.0</string>
+<key>CFBundleVersion</key><string>45</string>
+<key>CFBundleShortVersionString</key><string>1.5.7</string>
 <key>CFBundleIconFile</key><string>AppIcon</string>
 <key>CFBundleExecutable</key><string>UnfairPlayDesk</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>LSMinimumSystemVersion</key><string>27.0</string>
+<key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSHumanReadableCopyright</key><string>Local IPA workbench. Includes ipatool and UnfairPlay.</string>
 </dict></plist>

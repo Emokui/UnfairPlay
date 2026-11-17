@@ -6,8 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/majd/ipatool/v2/pkg/util"
@@ -31,10 +31,6 @@ func (t *appstore) ReplicateSinf(input ReplicateSinfInput) error {
 		return err
 	}
 
-	if err := t.os.Remove(input.PackagePath); err != nil {
-		return fmt.Errorf("failed to remove original file: %w", err)
-	}
-
 	if err := t.os.Rename(tmpPath, input.PackagePath); err != nil {
 		return fmt.Errorf("failed to rename replicated file: %w", err)
 	}
@@ -55,7 +51,7 @@ func (t *appstore) writeReplicatedZip(input ReplicateSinfInput, tmpPath string) 
 		}
 	}()
 
-	tmpFile, err := t.os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY, 0644)
+	tmpFile, err := t.os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
 		return fmt.Errorf("failed to open file: %w", err)
 	}
@@ -66,6 +62,10 @@ func (t *appstore) writeReplicatedZip(input ReplicateSinfInput, tmpPath string) 
 		}
 	}()
 
+	if err := tmpFile.Chmod(0600); err != nil {
+		return fmt.Errorf("failed to set replicated file permissions: %w", err)
+	}
+
 	zipWriter := zip.NewWriter(tmpFile)
 	defer func() {
 		if closeErr := zipWriter.Close(); closeErr != nil {
@@ -73,7 +73,11 @@ func (t *appstore) writeReplicatedZip(input ReplicateSinfInput, tmpPath string) 
 		}
 	}()
 
-	err = t.replicateZip(zipReader, zipWriter, input.PackagePath)
+	replacing, err := t.sinfReplacementPaths(zipReader, input.Sinfs)
+	if err != nil {
+		return err
+	}
+	err = t.replicateZip(zipReader, zipWriter, input.PackagePath, replacing)
 	if err != nil {
 		return fmt.Errorf("failed to replicate zip: %w", err)
 	}
@@ -93,19 +97,19 @@ func (t *appstore) appendSinfs(zipReader *zip.ReadCloser, zipWriter *zip.Writer,
 		return fmt.Errorf("failed to read bundle name: %w", err)
 	}
 
-	manifest, err := t.readManifestPlist(zipReader)
+	manifest, err := t.readManifestPlist(zipReader, bundleName)
 	if err != nil {
 		return fmt.Errorf("failed to read manifest plist: %w", err)
-	}
-
-	info, err := t.readInfoPlist(zipReader)
-	if err != nil {
-		return fmt.Errorf("failed to read info plist: %w", err)
 	}
 
 	if manifest != nil {
 		err = t.replicateSinfFromManifest(*manifest, zipWriter, sinfs, bundleName)
 	} else {
+		var info *packageInfo
+		info, err = t.readInfoPlist(zipReader, bundleName)
+		if err != nil {
+			return fmt.Errorf("failed to read info plist: %w", err)
+		}
 		err = t.replicateSinfFromInfo(*info, zipWriter, sinfs, bundleName)
 	}
 
@@ -139,9 +143,17 @@ func (*appstore) replicateSinfFromManifest(manifest packageManifest, zip *zip.Wr
 		return fmt.Errorf("failed to zip sinfs: %w", err)
 	}
 
+	written := make(map[string][]byte)
 	for _, pair := range zipped {
 		sp := fmt.Sprintf("Payload/%s.app/%s", bundleName, pair.Second)
 
+		if previous, exists := written[sp]; exists {
+			if !bytes.Equal(previous, pair.First.Data) {
+				return errors.New("conflicting SINF entries for the same path")
+			}
+			continue
+		}
+		written[sp] = pair.First.Data
 		file, err := zip.Create(sp)
 		if err != nil {
 			return fmt.Errorf("failed to create file: %w", err)
@@ -172,7 +184,7 @@ func (t *appstore) replicateSinfFromInfo(info packageInfo, zip *zip.Writer, sinf
 	return nil
 }
 
-func (t *appstore) replicateZip(src *zip.ReadCloser, dst *zip.Writer, sourcePath string) error {
+func (t *appstore) replicateZip(src *zip.ReadCloser, dst *zip.Writer, sourcePath string, replacing ...map[string]bool) error {
 	source, err := os.Open(sourcePath)
 	if err != nil {
 		return fmt.Errorf("failed to open zip headers: %w", err)
@@ -191,17 +203,20 @@ func (t *appstore) replicateZip(src *zip.ReadCloser, dst *zip.Writer, sourcePath
 	}
 
 	for _, file := range src.File {
+		localExtra, err := headers.extra(file)
+		if err != nil {
+			return fmt.Errorf("failed to read local metadata for %q: %w", file.Name, err)
+		}
+
+		if len(replacing) > 0 && replacing[0][file.Name] {
+			continue
+		}
 		srcFile, err := file.OpenRaw()
 		if err != nil {
 			return fmt.Errorf("failed to open file: %w", err)
 		}
 
 		header := file.FileHeader
-
-		localExtra, err := headers.extra(file)
-		if err != nil {
-			return fmt.Errorf("failed to read local metadata for %q: %w", file.Name, err)
-		}
 
 		header.Extra = zipStoredExtra(&header, localExtra)
 		// Frame deflated files with a trailing descriptor for streaming
@@ -231,78 +246,84 @@ func (t *appstore) replicateZip(src *zip.ReadCloser, dst *zip.Writer, sourcePath
 	return nil
 }
 
-func (*appstore) readInfoPlist(reader *zip.ReadCloser) (*packageInfo, error) {
-	for _, file := range reader.File {
-		if strings.Contains(file.Name, ".app/Info.plist") {
-			src, err := file.Open()
-			if err != nil {
-				return nil, fmt.Errorf("failed to open file: %w", err)
-			}
+func (*appstore) readInfoPlist(reader *zip.ReadCloser, bundleName string) (*packageInfo, error) {
+	file, err := reader.Open("Payload/" + bundleName + ".app/Info.plist")
+	if err != nil {
+		return nil, fmt.Errorf("failed to open main app Info.plist: %w", err)
+	}
+	defer file.Close()
 
-			data := new(bytes.Buffer)
-			_, err = io.Copy(data, src)
-
-			if err != nil {
-				return nil, fmt.Errorf("failed to copy data: %w", err)
-			}
-
-			var info packageInfo
-			_, err = plist.Unmarshal(data.Bytes(), &info)
-
-			if err != nil {
-				return nil, fmt.Errorf("failed to unmarshal data: %w", err)
-			}
-
-			return &info, nil
-		}
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read main app Info.plist: %w", err)
 	}
 
-	return nil, nil
+	var info packageInfo
+	if _, err := plist.Unmarshal(data, &info); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal data: %w", err)
+	}
+
+	return &info, nil
 }
 
-func (*appstore) readManifestPlist(reader *zip.ReadCloser) (*packageManifest, error) {
-	for _, file := range reader.File {
-		if strings.HasSuffix(file.Name, ".app/SC_Info/Manifest.plist") {
-			src, err := file.Open()
-			if err != nil {
-				return nil, fmt.Errorf("failed to open file: %w", err)
-			}
+func (*appstore) readManifestPlist(reader *zip.ReadCloser, bundleName string) (*packageManifest, error) {
+	file, err := reader.Open("Payload/" + bundleName + ".app/SC_Info/Manifest.plist")
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to open main app manifest: %w", err)
+	}
+	defer file.Close()
 
-			data := new(bytes.Buffer)
-			_, err = io.Copy(data, src)
-
-			if err != nil {
-				return nil, fmt.Errorf("failed to copy data: %w", err)
-			}
-
-			var manifest packageManifest
-
-			_, err = plist.Unmarshal(data.Bytes(), &manifest)
-			if err != nil {
-				return nil, fmt.Errorf("failed to unmarshal data: %w", err)
-			}
-
-			return &manifest, nil
-		}
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read main app manifest: %w", err)
 	}
 
-	return nil, nil
+	var manifest packageManifest
+	if _, err := plist.Unmarshal(data, &manifest); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal data: %w", err)
+	}
+
+	return &manifest, nil
 }
 
 func (*appstore) readBundleName(reader *zip.ReadCloser) (string, error) {
-	var bundleName string
-
 	for _, file := range reader.File {
-		if strings.Contains(file.Name, ".app/Info.plist") && !strings.Contains(file.Name, "/Watch/") {
-			bundleName = filepath.Base(strings.TrimSuffix(file.Name, ".app/Info.plist"))
-
-			break
+		name, inPayload := strings.CutPrefix(file.Name, "Payload/")
+		name, isInfo := strings.CutSuffix(name, ".app/Info.plist")
+		if inPayload && isInfo && name != "" && !strings.Contains(name, "/") {
+			return name, nil
 		}
 	}
 
-	if bundleName == "" {
-		return "", errors.New("could not read bundle name")
-	}
+	return "", errors.New("could not read bundle name")
+}
 
-	return bundleName, nil
+func (t *appstore) sinfReplacementPaths(reader *zip.ReadCloser, sinfs []Sinf) (map[string]bool, error) {
+	paths := make(map[string]bool)
+	if len(sinfs) == 0 {
+		return paths, nil
+	}
+	name, err := t.readBundleName(reader)
+	if err != nil {
+		return nil, err
+	}
+	manifest, err := t.readManifestPlist(reader, name)
+	if err != nil {
+		return nil, err
+	}
+	if manifest != nil {
+		for _, path := range manifest.SinfPaths {
+			paths[fmt.Sprintf("Payload/%s.app/%s", name, path)] = true
+		}
+	} else {
+		info, err := t.readInfoPlist(reader, name)
+		if err != nil {
+			return nil, err
+		}
+		paths[fmt.Sprintf("Payload/%s.app/SC_Info/%s.sinf", name, info.BundleExecutable)] = true
+	}
+	return paths, nil
 }

@@ -1,6 +1,11 @@
 package http
 
-import gohttp "net/http"
+import (
+	"errors"
+	gohttp "net/http"
+)
+
+var ErrTransferIdleTimeout = errors.New("download received no data for 45 seconds")
 
 // Executor delegates request encoding and execution to a Store runtime. The
 // generic client retains the existing response types and cookie persistence.

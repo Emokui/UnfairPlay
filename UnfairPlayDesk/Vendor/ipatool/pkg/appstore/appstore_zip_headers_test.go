@@ -13,6 +13,7 @@ import (
 	"github.com/majd/ipatool/v2/pkg/util/operatingsystem"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"howett.net/plist"
 )
 
 var _ = Describe("AppStore (ZIP local metadata)", func() {
@@ -29,7 +30,7 @@ var _ = Describe("AppStore (ZIP local metadata)", func() {
 			original, patched := filepath.Join(dir, "original.ipa"), filepath.Join(dir, "patched.ipa")
 			Expect(os.WriteFile(original, source, 0600)).To(Succeed())
 			store := &appstore{os: operatingsystem.New()}
-			Expect(store.applyPatches(downloadItemResult{Metadata: map[string]interface{}{}}, Account{}, original, patched, nil)).To(Succeed())
+			Expect(store.applyPatches(downloadItemResult{Metadata: map[string]interface{}{}}, Account{}, original, patched, nil, false)).To(Succeed())
 			checkTimestampZIP(patched, local, central)
 			Expect(store.ReplicateSinf(ReplicateSinfInput{PackagePath: patched, Sinfs: []Sinf{{Data: []byte("sinf")}}})).To(Succeed())
 			checkTimestampZIP(patched, local, central)
@@ -42,6 +43,53 @@ var _ = Describe("AppStore (ZIP local metadata)", func() {
 		Entry("no extended timestamps", []byte{}, []byte{}),
 		Entry("unknown local field", []byte{0xfe, 0xca, 3, 0, 1, 2, 3}, []byte{}),
 	)
+
+	It("replaces an existing SINF before retained ZIP entries using the main app plist", func() {
+		dir, err := os.MkdirTemp("", "ipatool-zip-replace-*")
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(os.RemoveAll, dir)
+		path := filepath.Join(dir, "app.ipa")
+		mainInfo, err := plist.Marshal(packageInfo{BundleExecutable: "Main"}, plist.BinaryFormat)
+		Expect(err).NotTo(HaveOccurred())
+		watchInfo, err := plist.Marshal(packageInfo{BundleExecutable: "Watch"}, plist.BinaryFormat)
+		Expect(err).NotTo(HaveOccurred())
+		var original bytes.Buffer
+		archive := zip.NewWriter(&original)
+		const license = "Payload/Test.app/SC_Info/Main.sinf"
+		const resource = "Payload/Test.app/resource.txt"
+		for _, entry := range []struct {
+			name string
+			data []byte
+		}{
+			{"Payload/Test.app/Watch/Watch.app/Info.plist", watchInfo},
+			{"Payload/Test.app/Info.plist", mainInfo},
+			{license, []byte("old")},
+			{resource, []byte("keep")},
+		} {
+			writer, err := archive.Create(entry.name)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = writer.Write(entry.data)
+			Expect(err).NotTo(HaveOccurred())
+		}
+		Expect(archive.Close()).To(Succeed())
+		Expect(os.WriteFile(path, original.Bytes(), 0600)).To(Succeed())
+		Expect(os.WriteFile(path+".tmp", make([]byte, 128<<10), 0600)).To(Succeed())
+
+		store := &appstore{os: operatingsystem.New()}
+		Expect(store.ReplicateSinf(ReplicateSinfInput{PackagePath: path, Sinfs: []Sinf{{Data: []byte("new")}}})).To(Succeed())
+		result, err := zip.OpenReader(path)
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(result.Close)
+		Expect(result.File).To(HaveLen(4))
+		for name, value := range map[string]string{license: "new", resource: "keep"} {
+			file, err := result.Open(name)
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(file.Close)
+			data, err := io.ReadAll(file)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(data)).To(Equal(value))
+		}
+	})
 
 	It("reads local extras in central-directory order, including prefixed archives", func() {
 		data := timestampZIP(localTimestamp, nil)

@@ -57,7 +57,7 @@ func TestDownloadArtworkAndIncludeInIPA(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if err := store.applyPatches(downloadItemResult{Metadata: map[string]interface{}{}}, Account{}, path, path+".ipa", data); err != nil {
+		if err := store.applyPatches(downloadItemResult{Metadata: map[string]interface{}{}}, Account{}, path, path+".ipa", data, false); err != nil {
 			t.Fatal(err)
 		}
 

@@ -32,8 +32,36 @@ func newRootCommand() *cobra.Command {
 		SilenceErrors: true,
 		Version:       version,
 	}
-	root.AddCommand(newSetupCommand(), newCollectCommand(), newRecoverCommand(), newDecryptCommand(), newConvertIPAMacOSCommand(), newVerifyCommand(), newDoctorCommand(), newProfileCommand())
+	root.AddCommand(newSetupCommand(), newCollectCommand(), newRecoverCommand(), newDecryptCommand(), newConvertIPAMacOSCommand(), newVerifyCommand(), newDoctorCommand(), newProfileCommand(), newIPAStatusCommand())
 	return root
+}
+
+func newIPAStatusCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "ipa-status <ipa>...",
+		Short: "Report Mach-O encryption markers in IPA files",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(_ *cobra.Command, paths []string) error {
+			type item struct {
+				Path   string `json:"path"`
+				Status string `json:"status"`
+			}
+			items := make([]item, 0, len(paths))
+			for _, path := range paths {
+				encrypted, err := fairplay.IPAHasEncryptedImages(path)
+				status := "unknown"
+				if err == nil {
+					if encrypted {
+						status = "encrypted"
+					} else {
+						status = "clear"
+					}
+				}
+				items = append(items, item{path, status})
+			}
+			return printJSON(items)
+		},
+	}
 }
 
 func printJSON(value any) error {

@@ -6,35 +6,82 @@ import Darwin
 typealias ViewState<Value> = SwiftUI.State<Value>
 
 enum Page: String, CaseIterable, Identifiable {
-    case account = "账户与模型", download = "下载 IPA", setup = "初始化模型", decrypt = "解密与验证"
+    case account = "账户与模型", download = "搜索与下载", decrypt = "解密与验证"
     var id: String { rawValue }
-    var icon: String { switch self { case .account: "person.crop.circle"; case .download: "arrow.down.circle"; case .setup: "key.horizontal"; case .decrypt: "lock.open" } }
+    var icon: String { switch self { case .account: "person.crop.circle"; case .download: "arrow.down.circle"; case .decrypt: "lock.open" } }
+}
+
+private struct ModelSetupSelection {
+    var appPath = ""
+    var ipaPath = ""
+}
+
+struct OperationNotice: Identifiable {
+    let id = UUID()
+    let title: String
+    let detail: String?
 }
 
 struct ContentView: View {
     @StateObject var store = Store()
     @StateObject var runner = Runner()
+    @StateObject var catalog = DownloadCatalog()
     @ViewState var page: Page = .account
     @ViewState var profileName = ""
     @ViewState var newAppleID = ""
     @ViewState var showAddID = false
-    @ViewState var showConsole = false
+    @ViewState var showAccountMenu = false
+    @ViewState var pendingLogin: Profile?
+    @ViewState var showDownloads = false
+    @ViewState var downloadedIPAs = DownloadedIPA.load()
+    @AppStorage("fallbackIPADownloadDirectory") var downloadDirectoryPath = ""
+    @ViewState var ipaFolderRevision = 0
     @ViewState var appLink = ""
-    @ViewState var appPath = ""
-    @ViewState var setupIPA = ""
-    @ViewState var inputIPA = ""
-    @ViewState var reply = ""
-    @ViewState var result: URL?
+    @ViewState var catalogQuery = ""
+    @ViewState var submittedCatalogQuery = ""
+    @ViewState var showAppDetails = false
+    @ViewState var purchasePageAppID: String?
+    @ViewState var showModelSetup = false
+    @ViewState var showVersionEntry = false
+    @ViewState var preventAppStoreUpdates = false
+    @ViewState private var setupSelections: [UUID: ModelSetupSelection] = [:]
+    @ViewState var inputIPAs: [URL] = []
+    @ViewState var manuallyAddedIPAs: [URL] = []
+    @ViewState var ipaStatuses: [URL: IPAStatusEntry] = [:]
+    @ViewState var recentIPAOutputs: [URL] = []
+    @ViewState var ipaBatchPosition: String?
     @ViewState var operationAccount = ""
     @ViewState var alertText: String?
+    @ViewState var completionNotice: OperationNotice?
+    @FocusState private var addIDFocused: Bool
     @ViewState var accountToClear: Profile?
     @ViewState var accountToLogin: Profile?
-    @ViewState var retryLoginID: UUID?
+    @ViewState var appStoreAcquisitionURL: URL?
+    @ViewState var accountsNeedingLogin = Set<UUID>()
+    @ViewState var regionLookupAttempted = Set<UUID>()
     @ViewState var showClearConfirmation = false
     @ViewState var accountToDeleteModel: Profile?
     @ViewState var showDeleteModelConfirmation = false
     @ViewState var accountToDelete: Profile?
     @ViewState var showDeleteAccountConfirmation = false
+    var needsSelectedLogin: Bool { store.selected.map(accountsNeedingLogin.contains) ?? false }
+    var canDownload: Bool {
+        store.canUseSelected && store.selectedProfile?.appleID != nil &&
+            store.selectedProfile?.loginCleared != true && !needsSelectedLogin
+    }
+    var appPath: String {
+        get { store.selected.flatMap { setupSelections[$0]?.appPath } ?? "" }
+        nonmutating set {
+            if let account = store.selected { setupSelections[account, default: ModelSetupSelection()].appPath = newValue }
+        }
+    }
+    var setupIPA: String {
+        get { store.selected.flatMap { setupSelections[$0]?.ipaPath } ?? "" }
+        nonmutating set {
+            if let account = store.selected { setupSelections[account, default: ModelSetupSelection()].ipaPath = newValue }
+        }
+    }
+    var decryptableIPAs: [URL] { inputIPAs.filter { ipaStatuses[$0]?.status != .clear } }
     var toolDir: URL { Bundle.main.resourceURL!.appendingPathComponent("Tools") }
     func tool(_ name: String) -> URL { toolDir.appendingPathComponent(name) }
     init(store: @autoclosure @escaping () -> Store = Store(), runner: @autoclosure @escaping () -> Runner = Runner(), initialPage: Page = .account) {
@@ -45,58 +92,117 @@ struct ContentView: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            sidebar
+            sidebar.zIndex(1)
             Divider()
-            VStack(alignment: .leading, spacing: 24) {
-                VStack(alignment: .leading, spacing: 7) {
-                    Text(page.rawValue).font(.system(size: 26, weight: .semibold))
-                    Text(subtitle).font(.callout).foregroundStyle(.secondary)
-                }
-                modelPicker
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 18) {
-                        switch page {
-                        case .account: accountView
-                        case .download: downloadView
-                        case .setup: setupView
-                        case .decrypt: decryptView
-                        }
-                    }.frame(maxWidth: .infinity, alignment: .leading).padding(.bottom, 4)
-                }.scrollIndicators(.hidden)
-                activityView.background(ConsoleDismissMonitor { showConsole = false })
-            }.padding(30).frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(Color(nsColor: .windowBackgroundColor))
-        }.frame(minWidth: 900, minHeight: 650)
-        .onChange(of: runner.busy) { if runner.busy { showConsole = true } }
-        .sheet(isPresented: $showAddID) {
-            VStack(alignment: .leading, spacing: 18) {
-                Text("添加新 ID").font(.title2.bold())
-                Text("自动创建独立账户档案，并进入登录流程。").foregroundStyle(.secondary)
-                TextField("Apple ID（邮箱或手机号）", text: $newAppleID).textFieldStyle(.roundedBorder)
-                TextField("显示名称（可选，例如：日本 ID）", text: $profileName).textFieldStyle(.roundedBorder)
-                Text("密码和验证码将在主窗口的隐藏输入框中输入。未设置显示名称时，使用 Apple ID 作为档案名称。").font(.caption).foregroundStyle(.secondary)
-                HStack {
+            VStack(alignment: .leading, spacing: 0) {
+                HStack(alignment: .center, spacing: 16) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(page.rawValue).font(.system(size: 23, weight: .semibold))
+                        Text(subtitle).font(.system(size: 12)).foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 0)
+                    if runner.busy { operationIndicator }
+                    else if let completionNotice { operationCompletion(completionNotice) }
+                }.frame(maxWidth: DeskAppearance.contentWidth).frame(maxWidth: .infinity)
+                    .padding(.horizontal, 32).padding(.top, 26).padding(.bottom, 22)
+                Group {
+                    switch page {
+                    case .download:
+                        downloadView
+                    case .decrypt:
+                        decryptView
+                    case .account:
+                        ScrollView {
+                            accountView.frame(maxWidth: DeskAppearance.contentWidth, alignment: .leading).frame(maxWidth: .infinity)
+                                .padding(.bottom, 24)
+                        }.scrollIndicators(.hidden)
+                    }
+                }.padding(.horizontal, 32).frame(maxWidth: .infinity, maxHeight: .infinity)
+            }.frame(maxWidth: .infinity, maxHeight: .infinity).background(DeskAppearance.background)
+        }.frame(minWidth: 900, minHeight: 650).font(.system(size: 12)).tint(DeskAppearance.accent)
+        .onAppear(perform: refreshIPAReferences)
+        .onChange(of: page) { refreshIPAReferences() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            refreshIPAReferences()
+            if page == .decrypt { ipaFolderRevision += 1 }
+        }
+        .onChange(of: runner.busy) {
+            if runner.busy { showAccountMenu = false }
+            else {
+                if page == .decrypt { ipaFolderRevision += 1 }
+                if store.selectedProfile?.storeFront == nil { syncAccountRegion() }
+            }
+        }
+        .onChange(of: runner.canReply) {
+            if runner.canReply { showDownloads = false }
+        }
+        .onChange(of: store.selected) {
+            completionNotice = nil
+            showAccountMenu = false
+            showModelSetup = false
+            showVersionEntry = false
+            purchasePageAppID = nil
+            refreshIPAReferences()
+            catalog.changeAccount()
+            let previousCountry = catalog.country
+            syncAccountRegion()
+            if page == .download && previousCountry == catalog.country { resumeCatalog() }
+        }
+        .onChange(of: catalog.country) { if page == .download { resumeCatalog() } }
+        .onChange(of: store.selectedProfile?.storeFront) { syncAccountRegion() }
+        .onChange(of: canDownload) { syncAccountRegion() }
+        .sheet(isPresented: $showAddID, onDismiss: {
+            if let account = pendingLogin {
+                pendingLogin = nil
+                login(account)
+            }
+        }) {
+            VStack(spacing: 12) {
+                DeskSheetHeader(symbol: "person.crop.circle.badge.plus", title: "添加新 ID",
+                                message: "为这个 Apple ID 创建独立的账户档案。")
+                VStack(spacing: 8) {
+                    TextField("Apple ID（邮箱或手机号）", text: $newAppleID).focused($addIDFocused)
+                    TextField("显示名称（可选）", text: $profileName)
+                }.textFieldStyle(.roundedBorder).controlSize(.large).padding(.vertical, 5)
+                HStack(spacing: 10) {
                     Spacer()
                     Button("取消", role: .cancel) { showAddID = false; newAppleID = ""; profileName = "" }
-                    Button("添加并登录", action: addAppleID).buttonStyle(.borderedProminent).tint(.teal)
+                        .keyboardShortcut(.cancelAction)
+                    Button("添加并登录", action: addAppleID).buttonStyle(DeskPrimaryButtonStyle(compact: true))
                         .disabled(newAppleID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                         .keyboardShortcut(.defaultAction)
                 }
-            }.padding(26).frame(width: 430)
+            }.padding(24).frame(width: 380).onAppear { addIDFocused = true }
         }
-        .alert("提示", isPresented: Binding(get: { alertText != nil || store.error != nil }, set: { if !$0 { alertText = nil; store.error = nil; accountToLogin = nil } })) {
-            if let account = accountToLogin {
+        .sheet(isPresented: Binding(get: { runner.canReply && !showAddID }, set: { presented in
+            if !presented && runner.canReply { runner.stop() }
+        })) {
+            if let prompt = runner.inputPrompt {
+                CredentialSheet(prompt: prompt, account: operationAccount, submit: runner.reply, cancel: runner.stop)
+                    .id(prompt).interactiveDismissDisabled()
+            }
+        }
+        .alert("提示", isPresented: Binding(get: { alertText != nil || store.error != nil }, set: { if !$0 {
+            alertText = nil; store.error = nil; accountToLogin = nil; appStoreAcquisitionURL = nil
+        } }), presenting: alertText ?? store.error) { detail in
+            if let url = appStoreAcquisitionURL {
+                Button("在 App Store 获取") { NSWorkspace.shared.open(url) }
+                Button("好", role: .cancel) { alertText = nil }
+            } else if let account = accountToLogin {
                 Button("重新登录") {
                     accountToLogin = nil
                     store.selected = account.id
-                    runner.sensitive = true
-                    run("ipatool", ["auth", "login"], "正在重新登录“\(account.name)”，请按下方提示输入", accountID: account.id)
+                    run("ipatool", ["auth", "login"], "正在重新登录“\(account.name)”", accountID: account.id)
                 }
                 Button("稍后", role: .cancel) { alertText = nil; accountToLogin = nil }
             } else {
                 Button("好") { alertText = nil; store.error = nil }
             }
-        } message: { Text(alertText ?? store.error ?? "") }
+            Button("复制详情") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(detail, forType: .string)
+            }
+        } message: { detail in Text(detail) }
         .confirmationDialog("清除“\(accountToClear?.name ?? "")”的登录信息？", isPresented: $showClearConfirmation, titleVisibility: .visible) {
             Button("清除登录信息", role: .destructive) {
                 if let account = accountToClear { clearLogin(account) }
@@ -126,269 +232,366 @@ struct ContentView: View {
         }
     }
     var sidebar: some View {
-        VStack(alignment: .leading, spacing: 30) {
-            HStack(spacing: 10) {
-                if let image = DeskAppearance.icon {
-                    Image(nsImage: image).resizable().frame(width: 38, height: 38)
-                }
-                Text("UnfairPlay").font(.system(size: 17, weight: .semibold))
-            }.padding(.top, 20)
-            VStack(spacing: 5) {
+        VStack(alignment: .leading, spacing: 32) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("UnfairPlay").font(.system(size: 18, weight: .semibold, design: .rounded))
+                Text("IPA WORKSPACE").font(.system(size: 9, weight: .medium)).tracking(2).foregroundStyle(.secondary)
+            }.padding(.horizontal, 10).padding(.top, 28)
+            VStack(spacing: 8) {
                 ForEach(Page.allCases) { item in
                     Button { page = item } label: {
-                        HStack(spacing: 11) {
-                            Image(systemName: item.icon).font(.system(size: 15)).frame(width: 20)
-                            Text(item.rawValue).font(.system(size: 13, weight: page == item ? .semibold : .regular))
+                        HStack(spacing: 12) {
+                            Image(systemName: item.icon).font(.system(size: 15, weight: .medium)).frame(width: 20)
+                            Text(item.rawValue).font(.system(size: 12, weight: page == item ? .semibold : .regular))
                             Spacer(minLength: 0)
-                        }.padding(.horizontal, 12).padding(.vertical, 11)
-                            .foregroundStyle(page == item ? Color.teal : Color.primary.opacity(0.75))
-                            .background(page == item ? Color.teal.opacity(0.1) : .clear, in: RoundedRectangle(cornerRadius: 9))
+                        }.padding(.horizontal, 13).padding(.vertical, 13)
+                            .foregroundStyle(page == item ? Color.white : Color.primary.opacity(0.65))
+                            .background(page == item ? DeskAppearance.accent : .clear, in: RoundedRectangle(cornerRadius: 11))
                             .contentShape(Rectangle())
                     }.buttonStyle(.plain)
                 }
             }
             Spacer()
+            accountSwitcher.padding(.bottom, 16)
             HStack {
-                Text("本机处理").font(.caption)
+                Text("本机处理")
                 Spacer()
                 Text(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")
-                    .font(.caption.monospacedDigit())
-            }.foregroundStyle(.tertiary)
-        }.padding(18).frame(width: 204).frame(maxHeight: .infinity).background(.bar)
+            }.font(.system(size: 10)).foregroundStyle(.tertiary).padding(.horizontal, 8)
+        }.padding(16).frame(width: 188).frame(maxHeight: .infinity).background(DeskAppearance.sidebar)
+    }
+    var accountSwitcher: some View {
+        HStack(spacing: 8) {
+            Button { showAccountMenu.toggle() } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "person.crop.circle.fill")
+                        .resizable().scaledToFit().frame(width: 28, height: 28)
+                        .foregroundStyle(DeskAppearance.accent.opacity(0.8))
+                    Text(store.selectedProfile?.name ?? "暂无账户")
+                        .font(.system(size: 11, weight: .medium)).foregroundStyle(.primary)
+                        .lineLimit(1).truncationMode(.tail).frame(maxWidth: .infinity, alignment: .leading)
+                    Image(systemName: "chevron.up").font(.system(size: 9, weight: .medium)).foregroundStyle(.secondary)
+                }.contentShape(Rectangle())
+            }.buttonStyle(.plain).disabled(store.profiles.isEmpty)
+                .help("切换账户").accessibilityLabel("切换账户")
+            Button { showAccountMenu = false; newAppleID = ""; profileName = ""; showAddID = true } label: {
+                Image(systemName: "plus").font(.system(size: 12, weight: .medium))
+                    .frame(width: 24, height: 28)
+                    .background(DeskAppearance.accent.opacity(0.07), in: RoundedRectangle(cornerRadius: 7))
+            }.buttonStyle(.plain).foregroundStyle(DeskAppearance.accent)
+                .help("添加账户").accessibilityLabel("添加账户")
+        }.padding(8).background(DeskAppearance.surface.opacity(0.8), in: RoundedRectangle(cornerRadius: 12))
+            .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.primary.opacity(0.035), lineWidth: 1))
+            .disabled(runner.busy || !store.storageReady)
+            .overlay(alignment: .bottomLeading) {
+                if showAccountMenu {
+                    accountMenuContents
+                        .background(DeskAppearance.surface, in: RoundedRectangle(cornerRadius: 10))
+                        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.primary.opacity(0.06), lineWidth: 1))
+                        .shadow(color: .black.opacity(0.1), radius: 12, y: 4)
+                        .padding(.bottom, 52)
+                        .background(OutsideClickMonitor { showAccountMenu = false })
+                        .onExitCommand { showAccountMenu = false }
+                }
+            }.zIndex(1)
+    }
+    var accountMenuContents: some View {
+        let font = NSFont.systemFont(ofSize: 12)
+        let nameWidth = store.profiles.map { ($0.name as NSString).size(withAttributes: [.font: font]).width }.max() ?? 0
+        return ScrollView {
+            VStack(spacing: 0) {
+                ForEach(store.profiles) { profile in
+                    Button {
+                        showAccountMenu = false
+                        store.selected = profile.id
+                    } label: {
+                        HStack {
+                            Text(profile.name).font(.system(size: 12)).lineLimit(1).truncationMode(.middle)
+                            Spacer()
+                            if store.selected == profile.id {
+                                Image(systemName: "checkmark").font(.system(size: 10, weight: .medium)).foregroundStyle(DeskAppearance.accent)
+                            }
+                        }.padding(.horizontal, 8).frame(maxWidth: .infinity).frame(height: 32)
+                            .background(store.selected == profile.id ? DeskAppearance.accent.opacity(0.07) : .clear, in: RoundedRectangle(cornerRadius: 6))
+                            .contentShape(Rectangle())
+                    }.buttonStyle(.plain).help(profile.name)
+                }
+            }
+        }.frame(height: min(CGFloat(store.profiles.count) * 32, 192)).scrollIndicators(.hidden)
+            .padding(4).frame(width: min(224, max(118, ceil(nameWidth) + 48))).disabled(runner.busy || !store.storageReady)
     }
     var subtitle: String {
         switch page {
         case .account: "管理 Apple ID 与对应模型。"
-        case .download: "下载应用，免费应用可自动获取许可。"
-        case .setup: "使用已安装的 iPhone 或 iPad 应用创建模型。"
+        case .download: "查找应用，选择版本，保存到本机。"
         case .decrypt: "使用当前账户的模型处理 IPA。"
         }
     }
-    var modelPicker: some View {
-        HStack(spacing: 14) {
-            Image(systemName: "person.crop.circle").font(.system(size: 28, weight: .light)).foregroundStyle(.secondary)
-            if store.profiles.isEmpty {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("尚未添加账户").font(.system(size: 13, weight: .medium))
-                    Text("添加 Apple ID 后开始使用").font(.caption).foregroundStyle(.secondary)
-                }
-            } else {
-                VStack(alignment: .leading, spacing: 3) {
-                    Picker("当前账户", selection: $store.selected) {
-                        ForEach(store.profiles) { Text($0.name).tag(Optional($0.id)) }
-                    }.labelsHidden().fixedSize().accessibilityLabel("当前账户")
-                    if let email = store.selectedProfile?.appleID {
-                        Text(email).font(.caption).foregroundStyle(.secondary).lineLimit(1).textSelection(.enabled)
-                    }
-                }
-            }
-            Spacer(minLength: 8)
-            Button { newAppleID = ""; profileName = ""; showAddID = true } label: {
-                Image(systemName: "plus").font(.system(size: 13, weight: .medium)).frame(width: 24, height: 24)
-            }.buttonStyle(.borderless).help("添加新 ID").accessibilityLabel("添加新 ID")
-        }.padding(16).deskCard().disabled(runner.busy || !store.storageReady)
-    }
     var accountView: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            VStack(alignment: .leading, spacing: 18) {
-                HStack {
-                    Label("登录会话", systemImage: "person.badge.key").font(.headline)
-                    Spacer()
-                    Menu {
-                        Button("清除此账户登陆", role: .destructive) {
-                            accountToClear = store.selectedProfile; showClearConfirmation = accountToClear != nil
+        VStack(alignment: .leading, spacing: 20) {
+            if store.profiles.isEmpty {
+                DeskEmptyState(symbol: "person.crop.circle.badge.plus", title: "从一个 Apple ID 开始", message: "独立保存登录会话与模型，随时切换账户。")
+                    .frame(height: 230)
+                Button("添加 Apple ID") { newAppleID = ""; profileName = ""; showAddID = true }
+                    .buttonStyle(DeskPrimaryButtonStyle(compact: true)).frame(maxWidth: .infinity).disabled(runner.busy)
+            } else {
+                VStack(alignment: .leading, spacing: 18) {
+                HStack(spacing: 13) {
+                    Image(systemName: "person.crop.circle").font(.system(size: 34, weight: .ultraLight)).foregroundStyle(DeskAppearance.accent)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(store.selectedProfile?.name ?? "账户").font(.system(size: 16, weight: .medium)).textSelection(.enabled)
+                        if let profile = store.selectedProfile {
+                            let identity = profile.appleID ?? profile.requestedAppleID
+                            if let identity, identity != profile.name {
+                                Text(identity).font(.system(size: 11)).foregroundStyle(.secondary).textSelection(.enabled)
+                            }
+                            HStack(spacing: 9) {
+                                Label(accountStatus(profile), systemImage: canDownload ? "checkmark.circle.fill" : "circle")
+                                    .foregroundStyle(needsSelectedLogin ? Color.orange : (canDownload ? DeskAppearance.accent : Color.secondary))
+                                if let region = StorefrontRegions.country(forStoreFront: profile.storeFront) {
+                                    Label(StorefrontRegions.name(for: region), systemImage: "globe").foregroundStyle(.secondary)
+                                        .help("账户商店地区")
+                                }
+                            }.font(.caption)
                         }
-                        Button("删除此账户档案", role: .destructive) {
-                            accountToDelete = store.selectedProfile; showDeleteAccountConfirmation = accountToDelete != nil
-                        }
-                    } label: { Image(systemName: "ellipsis").frame(width: 24, height: 20) }
-                        .menuStyle(.borderlessButton).fixedSize().help("账户操作")
-                }
-                Text(store.selectedProfile?.deletionPending == true ? "删除尚未完成，请在账户菜单中继续删除。" : "切换账户即可复用已保存的登录会话。")
-                    .font(.callout).foregroundStyle(.secondary)
-                HStack(spacing: 10) {
-                    Button("查看登录状态") { run("ipatool", ["auth", "info"], "正在查看登录状态") }
-                    if let account = store.selectedProfile, account.appleID == nil || retryLoginID == account.id {
-                        Button("继续登录") { login(account) }
                     }
-                }.disabled(!store.canUseSelected)
-            }.padding(20).deskCard().disabled(store.selected == nil)
-            VStack(alignment: .leading, spacing: 18) {
-                HStack {
-                    Label("账户模型", systemImage: "square.stack.3d.up").font(.headline)
                     Spacer()
                     Menu {
-                        Button("打开模型目录") { if let url = store.profileURL { NSWorkspace.shared.open(url) } }
-                        Button("重新校验模型") { store.refreshModel(force: true) }
-                        Divider()
-                        Button("删除当前模型", role: .destructive) {
-                            accountToDeleteModel = store.selectedProfile; showDeleteModelConfirmation = accountToDeleteModel != nil
+                        Button("查看状态") { run("ipatool", ["auth", "info"], "正在查看登录状态") }
+                            .disabled(!store.canUseSelected)
+                        if let account = store.selectedProfile, account.appleID == nil || account.loginCleared == true || accountsNeedingLogin.contains(account.id) {
+                            Button("继续登录") { login(account) }.disabled(!store.canUseSelected)
                         }
-                    } label: { Image(systemName: "ellipsis").frame(width: 24, height: 20) }
-                        .menuStyle(.borderlessButton).fixedSize().help("模型操作")
+                        Divider()
+                        Button("清除此账户登陆", role: .destructive) { accountToClear = store.selectedProfile; showClearConfirmation = accountToClear != nil }
+                            .disabled(!store.canUseSelected || store.selectedProfile?.loginCleared == true ||
+                                      (store.selectedProfile?.appleID == nil && !needsSelectedLogin))
+                        Button("删除此账户档案", role: .destructive) { accountToDelete = store.selectedProfile; showDeleteAccountConfirmation = accountToDelete != nil }
+                    } label: { Image(systemName: "ellipsis").frame(width: 20, height: 20) }
+                        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().help("账户操作").accessibilityLabel("账户操作").disabled(runner.busy)
                 }
-                modelStatus
-                HStack(spacing: 10) {
-                    Button("导入模型…") { importModel() }
-                    Button("初始化模型") { page = .setup }
+                    Divider()
+                if store.selectedProfile?.deletionPending == true {
+                    Text("此档案删除未完成，请从账户菜单继续删除。")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
-            }.padding(20).deskCard().disabled(!store.canUseSelected)
-            if store.unresolvedReports > 0 {
-                HStack {
-                    Label("\(store.unresolvedReports) 份旧报告待确认归属", systemImage: "doc.text").foregroundStyle(.secondary)
-                    Spacer()
-                    Button("查看") { NSWorkspace.shared.open(store.root.appendingPathComponent("Reports")) }
-                }.font(.caption)
+                VStack(alignment: .leading, spacing: 16) {
+                    HStack {
+                        Label("账户模型", systemImage: "square.stack.3d.up")
+                            .font(.system(size: 12, weight: .medium))
+                        Spacer()
+                        Menu {
+                            Button("打开模型目录") { if let url = store.profileURL { NSWorkspace.shared.open(url) } }
+                            Button("重新校验模型") { store.refreshModel(force: true) }.disabled(runner.busy)
+                            Divider()
+                            Button("删除当前模型", role: .destructive) { accountToDeleteModel = store.selectedProfile; showDeleteModelConfirmation = accountToDeleteModel != nil }.disabled(runner.busy)
+                        } label: { Image(systemName: "ellipsis").frame(width: 20, height: 20) }
+                            .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().help("模型操作")
+                    }
+                    modelStatus
+                    HStack(spacing: 10) {
+                        Button("导入模型…", action: importModel).controlSize(.small).disabled(runner.busy)
+                        Spacer()
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.16)) { showModelSetup.toggle() }
+                        } label: {
+                            HStack(spacing: 6) {
+                                Text(showModelSetup ? "收起初始化" : "初始化模型")
+                                Image(systemName: showModelSetup ? "chevron.up" : "chevron.down").font(.system(size: 9, weight: .medium))
+                            }.font(.system(size: 11))
+                        }.buttonStyle(.borderless)
+                    }.disabled(!store.canUseSelected)
+                    if showModelSetup {
+                        Divider()
+                        modelSetupView
+                    }
+                }
+                }.padding(20).deskCard(cornerRadius: 16)
+                if store.unresolvedReports > 0 {
+                    HStack {
+                        Text("\(store.unresolvedReports) 份旧报告待确认归属").foregroundStyle(.secondary)
+                        Spacer()
+                        Button("查看报告") { NSWorkspace.shared.open(store.root.appendingPathComponent("Reports")) }
+                    }.font(.caption)
+                }
             }
-        }.disabled(runner.busy || !store.storageReady)
+        }.disabled(!store.storageReady)
+    }
+    private func accountStatus(_ profile: Profile) -> String {
+        if profile.deletionPending == true { return "待完成删除" }
+        if profile.loginCleared == true { return "登录已清除" }
+        if accountsNeedingLogin.contains(profile.id) { return "需要重新登录" }
+        return profile.appleID == nil ? "未登录" : "已登录"
     }
     var modelStatus: some View {
         Label(store.modelMessage, systemImage: store.modelReady ? "checkmark.circle.fill" : "circle.dashed")
-            .font(.callout).foregroundStyle(store.modelReady ? Color.teal : Color.secondary)
+            .font(.system(size: 12)).foregroundStyle(store.modelReady ? DeskAppearance.accent : Color.secondary)
             .fixedSize(horizontal: false, vertical: true)
     }
-    var downloadView: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            VStack(alignment: .leading, spacing: 14) {
-                Label("应用链接", systemImage: "link").font(.headline)
-                TextField("粘贴 App Store 链接或数字 ID", text: $appLink)
-                    .textFieldStyle(.roundedBorder).controlSize(.large)
-                Text("下载地区由账户决定。免费应用会尝试自动获取许可；付费应用需先购买。")
-                    .font(.caption).foregroundStyle(.secondary)
-            }.padding(20).deskCard()
-            Button(action: download) { Label("下载 IPA", systemImage: "arrow.down") }
-                .buttonStyle(.borderedProminent).controlSize(.large)
-                .disabled(Core.appID(appLink) == nil || !store.canUseSelected)
-            resultLink
-        }.disabled(runner.busy)
-    }
-    var setupView: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            Text("在 Mac App Store 登录对应 ID，安装并打开一次支持 Mac 的 iPhone / iPad 应用，再选择应用和匹配 IPA。")
-                .font(.callout).foregroundStyle(.secondary)
+    var modelSetupView: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("先在 Mac App Store 登录对应 ID，安装并打开兼容的 iPhone / iPad 应用，再选择应用与匹配 IPA。")
+                .font(.system(size: 11)).foregroundStyle(.secondary).lineSpacing(3)
             VStack(spacing: 0) {
-                pathRow("已安装应用", path: appPath, label: "选择应用…", icon: "app") { chooseApp() }
-                Divider().padding(.horizontal, 18)
-                pathRow("匹配 IPA", path: setupIPA, label: "选择 IPA…") { chooseIPA { setupIPA = $0.path } }
-            }.deskCard()
-            Button("授权并初始化", action: setup).buttonStyle(.borderedProminent).controlSize(.large)
-                .disabled(!store.canUseSelected || appPath.isEmpty || setupIPA.isEmpty)
-            Text("macOS 将请求管理员授权。已有模型会保留。")
-                .font(.caption).foregroundStyle(.secondary)
-        }.disabled(runner.busy)
+                pathRow("已安装应用", path: appPath, label: "选择应用", icon: "app") { chooseApp() }
+                Divider().padding(.horizontal, 12)
+                pathRow("匹配 IPA", path: setupIPA, label: "选择 IPA") { chooseIPA { setupIPA = $0.path } }
+            }.background(DeskAppearance.background, in: RoundedRectangle(cornerRadius: 10))
+            HStack(spacing: 12) {
+                Text("需要管理员授权，已有模型会保留。")
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                Spacer()
+                Button("授权并初始化", action: setup).buttonStyle(DeskPrimaryButtonStyle(compact: true))
+                    .disabled(runner.busy || !store.canUseSelected || appPath.isEmpty || setupIPA.isEmpty)
+            }
+        }
     }
     var decryptView: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            pathRow("加密 IPA", path: inputIPA, label: "选择 IPA…") { chooseIPA { inputIPA = $0.path } }.deskCard()
-            modelStatus
-            HStack(spacing: 12) {
-                Button(action: decrypt) { Label("解密并保存", systemImage: "lock.open") }
-                    .buttonStyle(.borderedProminent).controlSize(.large)
-                Button("仅验证") {
-                    guard let model = store.profileURL else { return }
-                    run("unfairplay", ["verify", "--input", inputIPA, "--model", model.path], "正在验证 IPA")
-                }.controlSize(.large).help("验证 IPA，不保留解密内容")
-            }.disabled(inputIPA.isEmpty || !store.modelReady || !store.canUseSelected)
-            Text("也可将 IPA 拖入此页。安装前仍需签名。")
-                .font(.caption).foregroundStyle(.secondary)
-            resultLink
-        }.disabled(runner.busy)
-        .onDrop(of: [UTType.fileURL.identifier], isTargeted: nil) { providers in
-            guard !runner.busy, let first = providers.first else { return false }
-            _ = first.loadObject(ofClass: URL.self) { url, _ in
-                if let url, url.pathExtension.lowercased() == "ipa" { DispatchQueue.main.async { inputIPA = url.path } }
+        VStack(alignment: .leading, spacing: 18) {
+            IPAFolderList(
+                folder: defaultDownloadFolder,
+                revision: ipaFolderRevision,
+                selection: $inputIPAs,
+                additionalFiles: recentIPAOutputs + manuallyAddedIPAs,
+                statuses: $ipaStatuses,
+                changeFolder: { chooseDefaultDownloadFolder() },
+                browse: addIPAsFromPicker
+            )
+            HStack {
+                Text("当前模型").font(.system(size: 12)).foregroundStyle(.secondary)
+                Spacer()
+                modelStatus
             }
-            return true
+            HStack(spacing: 14) {
+                Group {
+                    Button { processSelectedIPAs(verifyOnly: false) } label: {
+                        Label("解密并保存", systemImage: "lock.open")
+                    }.buttonStyle(DeskPrimaryButtonStyle()).controlSize(.large)
+                        .disabled(decryptableIPAs.isEmpty)
+                        .help("使用当前账户的模型解密")
+                    Button("仅验证") { processSelectedIPAs(verifyOnly: true) }
+                        .controlSize(.large).help("验证所选 IPA")
+                }.disabled(runner.busy || inputIPAs.isEmpty || !store.modelReady || !store.canUseSelected)
+                if inputIPAs.count > decryptableIPAs.count {
+                    let skipped = inputIPAs.count - decryptableIPAs.count
+                    Text("\(skipped) 份 IPA 无需解密").font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("移到废纸篓…", role: .destructive, action: trashSelectedIPAs)
+                    .disabled(runner.busy || inputIPAs.isEmpty)
+                    .help("将选中的 IPA 移到废纸篓")
+            }
+        }
+        .padding(.bottom, 24)
+        .frame(maxWidth: DeskAppearance.contentWidth, maxHeight: .infinity, alignment: .topLeading)
+        .frame(maxWidth: .infinity)
+        .onDrop(of: [UTType.fileURL.identifier], isTargeted: nil) { providers in
+            let files = providers.filter { $0.canLoadObject(ofClass: URL.self) }
+            for provider in files {
+                _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                    if let url { DispatchQueue.main.async { addInputIPAs([url]) } }
+                }
+            }
+            return !files.isEmpty
         }
     }
-    @ViewBuilder var resultLink: some View {
-        if let result {
-            Button { NSWorkspace.shared.activateFileViewerSelecting([result]) } label: {
-                Label(result.lastPathComponent, systemImage: "arrow.up.right.square")
-                    .lineLimit(1).truncationMode(.middle)
-            }.buttonStyle(.link).help("在 Finder 中显示")
+    func refreshIPAReferences() {
+        let existing = downloadedIPAs.filter { !Core.isMissingFile($0.url) }
+        if existing.count != downloadedIPAs.count {
+            downloadedIPAs = existing
+            DownloadedIPA.save(existing)
         }
+        if !setupIPA.isEmpty, Core.isMissingFile(URL(fileURLWithPath: setupIPA)) { setupIPA = "" }
+        let remainingInputs = inputIPAs.filter { !Core.isMissingFile($0) }
+        if remainingInputs.count != inputIPAs.count { inputIPAs = remainingInputs }
+        let remainingAdded = manuallyAddedIPAs.filter { !Core.isMissingFile($0) }
+        if remainingAdded.count != manuallyAddedIPAs.count { manuallyAddedIPAs = remainingAdded }
+        let remainingOutputs = recentIPAOutputs.filter { !Core.isMissingFile($0) }
+        if remainingOutputs.count != recentIPAOutputs.count { recentIPAOutputs = remainingOutputs }
     }
     func pathRow(_ name: String, path: String, label: String, icon: String = "doc.zipper", action: @escaping ()->Void) -> some View {
-        HStack(spacing: 14) {
-            Image(systemName: icon).font(.system(size: 26, weight: .light)).foregroundStyle(.teal).frame(width: 34)
-            VStack(alignment: .leading, spacing: 5) {
-                Text(name).font(.system(size: 13, weight: .medium))
+        HStack(spacing: 10) {
+            Image(systemName: icon).font(.system(size: 18, weight: .light)).foregroundStyle(DeskAppearance.accent).frame(width: 24)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(name).font(.system(size: 11, weight: .medium))
                 Text(path.isEmpty ? "尚未选择" : URL(fileURLWithPath: path).lastPathComponent)
-                    .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle).help(path)
+                    .font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle).help(path)
             }
             Spacer(minLength: 10)
-            Button(label, action: action)
-        }.padding(20)
+            Button(label, action: action).controlSize(.small)
+        }.padding(12)
     }
-    var activityView: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Divider()
-            HStack(spacing: 10) {
-                Button { showConsole.toggle() } label: {
-                    HStack(spacing: 10) {
-                        if runner.busy { ProgressView().controlSize(.small) }
-                        else { Image(systemName: runner.hint == nil ? "circle.fill" : "exclamationmark.circle.fill").font(.system(size: 7)).foregroundStyle(runner.hint == nil ? Color.teal : Color.orange) }
-                        Text(runner.title).font(.system(size: 12, weight: .medium)).lineLimit(1)
-                        if !operationAccount.isEmpty { Text(operationAccount).font(.caption).foregroundStyle(.secondary).lineLimit(1) }
-                        Spacer(minLength: 8)
-                        Image(systemName: showConsole ? "chevron.down" : "chevron.up").frame(width: 20, height: 20)
-                    }.frame(maxWidth: .infinity).contentShape(Rectangle())
-                }.buttonStyle(.plain).help(showConsole ? "收起操作记录" : "展开操作记录").accessibilityLabel("操作记录")
-                if runner.busy && !runner.privileged && !runner.saving { Button("取消") { runner.stop() }.controlSize(.small) }
-            }
-            if let hint = runner.hint { Text(hint).font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true) }
-            if let progress = runner.progress, runner.busy { ProgressView(value: progress).tint(.teal) }
-            if showConsole {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Text("操作记录").font(.caption).foregroundStyle(.secondary)
-                        Spacer()
-                        Button("清空") { runner.log = ""; runner.currentLine = "" }.buttonStyle(.borderless).font(.caption).disabled(runner.busy)
+    var operationIndicator: some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .trailing, spacing: 6) {
+                HStack(spacing: 8) {
+                    Text(runner.title).lineLimit(1).help(runner.title)
+                    if let ipaBatchPosition { Text(ipaBatchPosition).monospacedDigit() }
+                    if let progress = runner.progress {
+                        Text(progress, format: .percent.precision(.fractionLength(0))).monospacedDigit()
                     }
-                    ScrollViewReader { proxy in
-                        ScrollView {
-                            Text(runner.displayOutput).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                            Color.clear.frame(height: 1).id("end")
-                        }.frame(height: 108).onChange(of: runner.displayOutput) { proxy.scrollTo("end", anchor: .bottom) }
-                    }
-                }.padding(12).background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 10))
+                }
+                ProgressView(value: runner.progress)
+                    .progressViewStyle(.linear).controlSize(.small)
+                    .frame(width: 142).accessibilityLabel("任务进度")
             }
-            if runner.canReply {
-                HStack(spacing: 10) {
-                    if runner.sensitive { SecureField("按提示输入密码、验证码或口令", text: $reply).onSubmit(sendReply) }
-                    else { TextField("回复工具提示", text: $reply).onSubmit(sendReply) }
-                    Toggle("隐藏", isOn: $runner.sensitive).toggleStyle(.checkbox)
-                    Button("发送", action: sendReply).disabled(reply.isEmpty)
-                }.textFieldStyle(.roundedBorder)
+            if !runner.privileged && !runner.saving {
+                Button(action: runner.stop) { Image(systemName: "xmark.circle.fill") }
+                    .buttonStyle(.plain).help("取消任务").accessibilityLabel("取消任务")
             }
+        }.font(.system(size: 11)).foregroundStyle(.secondary).frame(maxWidth: 320, alignment: .trailing)
+    }
+    func showCompletion(_ title: String, detail: String? = nil, duration: TimeInterval = 5) {
+        let notice = OperationNotice(title: title, detail: detail)
+        completionNotice = notice
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration) {
+            if completionNotice?.id == notice.id { completionNotice = nil }
         }
     }
-    func sendReply() { runner.reply(reply); reply = "" }
+    private func operationCompletion(_ notice: OperationNotice) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "checkmark.circle.fill").foregroundStyle(DeskAppearance.accent)
+                .accessibilityHidden(true)
+            VStack(alignment: .trailing, spacing: 3) {
+                Text(notice.title).font(.system(size: 11, weight: .medium))
+                if let detail = notice.detail {
+                    Text(detail).font(.caption).foregroundStyle(.secondary)
+                        .lineLimit(1).truncationMode(.middle).help(detail)
+                }
+            }
+        }.frame(maxWidth: 320, alignment: .trailing)
+    }
+    func showOperationFailure(_ title: String) {
+        guard !runner.cancelled else { return }
+        alertText = Core.operationError(title: title, hint: runner.hint, output: runner.output)
+    }
     func addAppleID() {
         let email = newAppleID.trimmingCharacters(in: .whitespacesAndNewlines)
         let label = profileName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !email.isEmpty else { return }
         if let existing = store.profile(for: email) {
-            store.selected = existing.id; showAddID = false
-            if existing.appleID == nil { DispatchQueue.main.async { login(existing) } }
+            store.selected = existing.id
+            if existing.appleID == nil || existing.loginCleared == true || accountsNeedingLogin.contains(existing.id) { pendingLogin = existing }
             else { alertText = "此 ID 已存在，已切换到原账户档案。" }
+            showAddID = false; newAppleID = ""; profileName = ""
             return
         }
         guard let account = store.add(label.isEmpty ? email : label, requestedAppleID: email) else { showAddID = false; return }
+        pendingLogin = account
         showAddID = false; profileName = ""; newAppleID = ""
-        DispatchQueue.main.async { login(account) }
     }
     func login(_ account: Profile) {
-        run("ipatool", ["auth", "login"], "正在登录“\(account.name)”，请按提示输入密码", accountID: account.id)
+        run("ipatool", ["auth", "login"], "正在登录“\(account.name)”", accountID: account.id)
     }
-    func run(_ name: String, _ args: [String], _ title: String, privileged: Bool = false, accountID: UUID? = nil, done: ((Bool)->Void)? = nil) {
-        reply = ""
+    func run(_ name: String, _ args: [String], _ title: String, privileged: Bool = false, accountID: UUID? = nil, holdsCompletion: Bool = false, done: ((Bool)->Void)? = nil) {
         operationAccount = store.profiles.first { $0.id == (accountID ?? store.selected) }?.name ?? ""
         guard name == "ipatool" else {
             guard store.canUseSelected else { alertText = "当前账户配置不可用或删除尚未完成。"; done?(false); return }
-            runner.launch(tool(name), args, title: title, privileged: privileged, done: done); return
+            runner.launch(tool(name), args, title: title, privileged: privileged, holdsCompletion: holdsCompletion) { ok in
+                if !ok { showOperationFailure(title) }
+                done?(ok)
+            }
+            return
         }
         guard let id = accountID ?? store.selected, let account = store.profiles.first(where: { $0.id == id }), store.storageReady else {
             alertText = "账户配置不可用，请先修复配置或选择账户。"; done?(false); return
@@ -403,41 +606,54 @@ struct ContentView: View {
             if let index = arguments.firstIndex(of: "--email"), index + 1 < arguments.count { arguments[index + 1] = email }
             else { arguments += ["--email", email] }
         }
-        if login { retryLoginID = nil }
-        let execute = {
-            runner.launch(tool("ipatool"), prefix + arguments, title: title) { ok in
-                guard ok else { if login || info { retryLoginID = id }; done?(false); return }
-                if login || info {
-                    do {
-                        guard let email = Core.email(in: runner.output) else { throw DeskError("未能验证登录账户身份，请查看输出后重试。") }
-                        try store.bindIdentity(id, email: email)
-                    } catch {
-                        alertText = error.localizedDescription; runner.title = "账户身份校验未通过"; done?(false); return
-                    }
+        if arguments.first == "download", let email = account.appleID { arguments += ["--expected-account",email] }
+        runner.launch(tool("ipatool"), prefix + arguments, title: title, holdsCompletion: holdsCompletion) { ok in
+            guard ok else {
+                let error = runner.output.lowercased()
+                let licenseRejected = error.contains("free app license rejected after sign-in refresh")
+                let missingSession = Core.isMissingSession(in: error)
+                let needsLogin = missingSession || (!licenseRejected && (error.contains("auth code is required") ||
+                    error.contains("password token is expired") || error.contains("failed to refresh apple login") ||
+                    error.contains("session expired") || error.contains("download account does not match")))
+                if !runner.cancelled && needsLogin {
+                    accountsNeedingLogin.insert(id)
                 }
-                done?(true)
+                if args.first != "get-version-metadata" && !args.contains("--check-license") {
+                    if !runner.cancelled && args.first == "download" && needsLogin { accountToLogin = account }
+                    showOperationFailure(title)
+                }
+                done?(false); return
             }
-        }
-        if arguments.first == "download" {
-            runner.launch(tool("ipatool"), prefix + ["auth", "info"], title: "正在核对下载账户") { ok in
-                guard ok else { done?(false); return }
+            if login || info {
                 do {
-                    guard let email = Core.email(in: runner.output) else { throw DeskError("无法验证当前登录账户。") }
-                    try store.bindIdentity(id, email: email)
-                    execute()
-                } catch { alertText = error.localizedDescription; runner.title = "账户身份不匹配"; done?(false) }
+                    guard let email = Core.email(in: runner.output) else { throw DeskError("未能验证登录账户身份，请查看输出后重试。") }
+                    try store.bindIdentity(id, email: email, storeFront: Core.storeFront(in: runner.output))
+                    accountsNeedingLogin.remove(id)
+                    if store.selected == id {
+                        if login {
+                            catalog.updateAccountCountry(store.selectedProfile?.storeFront, afterLogin: true)
+                            catalog.purchaseStatus = [:]
+                        }
+                        showCompletion(login ? "登录成功" : "当前会话已登录", detail: email, duration: info ? 2 : 5)
+                    }
+                } catch {
+                    alertText = error.localizedDescription; runner.title = "账户身份校验未通过"; done?(false); return
+                }
             }
-        } else { execute() }
+            done?(true)
+        }
     }
     func clearLogin(_ account: Profile) {
         run("ipatool", ["auth", "revoke"], "正在清除“\(account.name)”的登录信息", accountID: account.id) { ok in
             guard ok else { return }
             let cookies = store.root.appendingPathComponent("Sessions/\(account.id.uuidString.lowercased())/cookies")
             do {
+                try store.markLoginCleared(account.id)
+                syncAccountRegion()
                 if FileManager.default.fileExists(atPath: cookies.path) { try FileManager.default.removeItem(at: cookies) }
                 runner.title = "“\(account.name)”的登录信息已清除"
                 accountToLogin = account
-                retryLoginID = account.id
+                accountsNeedingLogin.remove(account.id)
                 alertText = "“\(account.name)”的登录凭据和 Cookie 已清除，模型仍然保留。现在重新登录吗？"
             } catch {
                 alertText = "登录凭据已清除，但 Cookie 清理失败：\(error.localizedDescription)"
@@ -469,8 +685,10 @@ struct ContentView: View {
                     try await runner.fileWork("正在清理账户数据…") { try Core.removeAccountData(account.id, root: root) }.get()
                     try store.remove(account)
                     accountToLogin = nil
-                    if retryLoginID == account.id { retryLoginID = nil }
-                    reply = ""; runner.log = ""; runner.currentLine = ""; runner.output = ""; operationAccount = ""
+                    accountsNeedingLogin.remove(account.id)
+                    setupSelections.removeValue(forKey: account.id)
+                    regionLookupAttempted.remove(account.id)
+                    runner.log = ""; runner.currentLine = ""; runner.output = ""; operationAccount = ""
                     runner.title = "“\(account.name)”账户档案已删除"
                     alertText = "“\(account.name)”的账户档案、登录信息、会话目录、模型目录和关联报告已彻底删除。"
                 } catch {
@@ -480,8 +698,9 @@ struct ContentView: View {
             }
         }
     }
-    func chooseIPA(_ done: (URL)->Void) {
+    func chooseIPA(in folder: URL? = nil, _ done: (URL)->Void) {
         let panel = NSOpenPanel(); panel.allowedContentTypes = [UTType(filenameExtension: "ipa") ?? .data]; panel.canChooseDirectories = false
+        panel.directoryURL = folder
         if panel.runModal() == .OK, let url = panel.url { done(url) }
     }
     func chooseApp() {
@@ -526,25 +745,82 @@ struct ContentView: View {
                         }
                         store.refreshModel(force: true)
                         if !ok { runner.title = previousTitle; runner.hint = previousHint }
-                        if case .failure(let error) = imported { alertText = error.localizedDescription }
+                        switch imported {
+                        case .success:
+                            if ok { showCompletion("模型已导入") }
+                        case .failure(let error): alertText = error.localizedDescription
+                        }
                     }
                 }
             }
         }
     }
+    var defaultDownloadFolder: URL {
+        if !downloadDirectoryPath.isEmpty {
+            return URL(fileURLWithPath: downloadDirectoryPath, isDirectory: true)
+        }
+        return FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads", isDirectory: true)
+    }
+    @discardableResult
+    func chooseDefaultDownloadFolder(message: String = "选择保存 IPA 的默认文件夹。") -> URL? {
+        let picker = NSOpenPanel()
+        picker.canChooseDirectories = true
+        picker.canChooseFiles = false
+        picker.canCreateDirectories = true
+        picker.directoryURL = defaultDownloadFolder
+        picker.message = message
+        picker.prompt = "设为默认"
+        guard picker.runModal() == .OK, let folder = picker.url else { return nil }
+        downloadDirectoryPath = folder.path
+        ipaFolderRevision += 1
+        return folder
+    }
+    func downloadDirectory() -> URL? {
+        let folder = defaultDownloadFolder
+        var isDirectory = ObjCBool(false)
+        if FileManager.default.fileExists(atPath: folder.path, isDirectory: &isDirectory), isDirectory.boolValue {
+            return folder
+        }
+        return chooseDefaultDownloadFolder(message: "当前默认下载文件夹不可用，请选择新的默认文件夹。")
+    }
     func download() {
-        guard let id = Core.appID(appLink), store.canUseSelected else { return }
-        let panel = NSSavePanel(); panel.nameFieldStringValue = "App-\(id).ipa"; panel.allowedContentTypes = [UTType(filenameExtension: "ipa") ?? .data]
+        guard !runner.busy, let id = Core.appID(appLink), canDownload, catalog.validVersion,
+              !catalog.isWaitingForAppName(id), let folder = downloadDirectory() else { return }
+        let appName = catalog.app(for: id)?.name ?? "应用"
+        let paid = catalog.app(for: id)?.priceText != nil
+        let accountRegion = DownloadCatalog.country(forStoreFront: store.selectedProfile?.storeFront)
+        let noUpdate = preventAppStoreUpdates
+        let panel = NSSavePanel()
+        panel.directoryURL = folder
+        panel.nameFieldStringValue = DownloadedIPA.filename(for: appName, noUpdate: noUpdate)
+        panel.allowedContentTypes = [UTType(filenameExtension: "ipa") ?? .data]
         guard panel.runModal() == .OK, let target = panel.url else { return }
         do {
             let destination = try Core.OutputTarget(target)
             let stage = try WorkStage.create(beside: target, root: store.root, accountID: store.selected)
-            run("ipatool", ["download", "--app-id", id, "--purchase", "--output", stage.ipa.path], "正在下载 IPA") { ok in
+            let acquisition = paid ? [] : ["--purchase"]
+            let updateOptions = noUpdate ? ["--no-update"] : []
+            let arguments = ["download", "--app-id", id, "--output", stage.ipa.path] +
+                acquisition + updateOptions + catalog.versionArguments
+            completionNotice = nil
+            run("ipatool", arguments, "正在下载 IPA", holdsCompletion: true) { ok in
+                if !ok && !runner.cancelled {
+                    let error = runner.output.lowercased()
+                    if paid && error.contains("license is required") {
+                        catalog.purchaseStatus[id] = .unowned
+                    } else if !paid && (error.contains("license is required") || error.contains("free app license rejected after sign-in refresh")) {
+                        appStoreAcquisitionURL = URL(string: "https://apps.apple.com/\(accountRegion.lowercased())/app/id\(id)")
+                    }
+                }
                 Task { @MainActor in
-                    defer { do { try stage.cleanup() } catch { alertText = "临时目录清理失败：\(error.localizedDescription)" } }
+                    defer { do { try stage.cleanup() } catch { alertText = "临时目录清理失败：\(error.localizedDescription)" }; runner.finishCompletion() }
                     guard ok else { return }
                     if let saved = await saveCompletedIPA(stage.ipa, destination: destination) {
-                        result = saved; inputIPA = saved.path; setupIPA = saved.path
+                        let entry = DownloadedIPA(url: saved, appName: appName)
+                        downloadedIPAs.removeAll { $0.id == entry.id }
+                        downloadedIPAs.insert(entry, at: 0)
+                        DownloadedIPA.save(downloadedIPAs)
                     }
                 }
             }
@@ -575,47 +851,59 @@ struct ContentView: View {
         }
     }
     func setup() {
-        guard let model = store.profileURL, store.canUseSelected else { return }
-        do { try Core.privateDirectory(model) } catch { alertText = error.localizedDescription; return }
-        guard FileManager.default.fileExists(atPath: appPath), FileManager.default.fileExists(atPath: setupIPA) else { alertText = "选择的应用或 IPA 已不存在，请重新选择。"; return }
-        run("authorize", ["setup", "--app", appPath, "--ipa", setupIPA, "--model-dir", model.path], "等待系统授权并初始化", privileged: true) { ok in
-            store.refreshModel(force: true)
-            if ok && !Core.hasModel(model) { alertText = "模型基本检查未通过，请查看模型状态。" }
-        }
-    }
-    func decrypt() {
-        guard let model = store.profileURL, let accountID = store.selected, store.modelReady, store.canUseSelected else { return }
-        let input = URL(fileURLWithPath: inputIPA)
-        let panel = NSSavePanel(); panel.nameFieldStringValue = input.deletingPathExtension().lastPathComponent + ".decrypted.ipa"; panel.allowedContentTypes = [UTType(filenameExtension: "ipa") ?? .data]
-        guard panel.runModal() == .OK, let target = panel.url else { return }
-        if Core.sameFile(input, target) { alertText = "输出位置与原始 IPA 实际上是同一个文件。"; return }
-        do {
-            let destination = try Core.OutputTarget(target)
-            let reportDirectory = store.root.appendingPathComponent("Reports/\(accountID.uuidString)")
-            try Core.privateDirectory(reportDirectory)
-            let finalReport = reportDirectory.appendingPathComponent("\(UUID().uuidString).json")
-            let stage = try WorkStage.create(beside: target, root: store.root, accountID: accountID)
-            run("unfairplay", ["decrypt", "--input", input.path, "--model", model.path, "--output", stage.ipa.path, "--report", stage.report.path], "正在解密 IPA") { ok in
-                Task { @MainActor in
-                    defer { do { try stage.cleanup() } catch { alertText = "临时目录清理失败：\(error.localizedDescription)" } }
-                    guard ok else { return }
-                    if let saved = await saveCompletedIPA(stage.ipa, destination: destination, protecting: input) {
-                        result = saved
-                        do {
-                            try Core.finalizeReport(stage.report, output: saved, accountID: accountID)
-                            let json = try JSONSerialization.jsonObject(with: Data(contentsOf: stage.report))
-                            try Core.writeJSON(json, to: finalReport)
-                        } catch { alertText = "IPA 已成功保存，但报告保存失败：\(error.localizedDescription)" }
+        guard !runner.busy, store.canUseSelected, let model = store.profileURL, let accountID = store.selected else { return }
+        refreshIPAReferences()
+        guard !appPath.isEmpty, !setupIPA.isEmpty else { return }
+        let app = appPath
+        let source = URL(fileURLWithPath: setupIPA)
+        let root = store.root
+        Task { @MainActor in
+            let prepared = await runner.fileWork("正在准备初始化 IPA…") {
+                try Core.privateDirectory(model)
+                guard FileManager.default.fileExists(atPath: app) else { throw DeskError("所选应用已不存在，请重新选择。") }
+                let input = source.resolvingSymlinksInPath()
+                guard let stamp = try Core.fileStamp(input), stamp.mode & S_IFMT == S_IFREG else {
+                    throw DeskError("选择的 IPA 已不存在或不是普通文件，请重新选择。")
+                }
+                // The main app can read the chosen file under its own macOS privacy permissions.
+                // The privileged helper opens only the private copy, outside Downloads/Desktop.
+                let stage = try WorkStage.create(beside: root.appendingPathComponent("setup.ipa"), root: root, accountID: accountID)
+                do {
+                    try FileManager.default.copyItem(at: input, to: stage.ipa)
+                    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: stage.ipa.path)
+                    return stage
+                } catch {
+                    try? stage.cleanup()
+                    throw error
+                }
+            }
+            switch prepared {
+            case .failure(let error):
+                if Core.isFilePermissionError(error) {
+                    alertText = "UnfairPlay 无法读取所选 IPA。请重新选取文件，或在「系统设置 → 隐私与安全性 → 文件与文件夹」允许 UnfairPlay 访问它所在的文件夹。\n\n\(error.localizedDescription)"
+                } else {
+                    alertText = "无法准备初始化 IPA：\(error.localizedDescription)"
+                }
+            case .success(let stage):
+                run("authorize", ["setup", "--app", app, "--ipa", stage.ipa.path, "--model-dir", model.path], "等待系统授权并初始化", privileged: true) { ok in
+                    do { try stage.cleanup() } catch {
+                        let message = "临时 IPA 清理失败：\(error.localizedDescription)"
+                        alertText = alertText.map { $0 + "\n\n" + message } ?? message
+                    }
+                    store.refreshModel(force: true)
+                    if ok {
+                        if Core.hasModel(model) { showCompletion("模型已初始化") }
+                        else { alertText = "模型基本检查未通过，请查看模型状态。" }
                     }
                 }
             }
-        } catch { alertText = error.localizedDescription }
+        }
     }
 
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    func applicationDidFinishLaunching(_ notification: Notification) { NSApp.setActivationPolicy(.regular); NSApp.activate(ignoringOtherApps: true) }
+    func applicationDidFinishLaunching(_ notification: Notification) { NSApp.appearance = NSAppearance(named: .aqua); NSApp.setActivationPolicy(.regular); NSApp.activate(ignoringOtherApps: true) }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         let active = Array(Runner.active.values)
@@ -648,8 +936,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 struct UnfairPlayDeskApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
     var body: some Scene {
-        Window("UnfairPlay", id: "main") { ContentView().tint(.teal) }
-            .windowStyle(.hiddenTitleBar).defaultSize(width: 1000, height: 740)
+        Window("UnfairPlay", id: "main") { ContentView().tint(DeskAppearance.accent) }
+            .windowStyle(.hiddenTitleBar).defaultSize(width: 1080, height: 760)
             .commands { CommandGroup(replacing: .newItem) {} }
     }
 }

@@ -78,12 +78,12 @@ func TestSinglePassDownloadMatchesTwoPassPersonalization(t *testing.T) {
 	account := Account{Email: "test@example.invalid"}
 	combined := filepath.Join(t.TempDir(), "combined.ipa")
 	old := filepath.Join(t.TempDir(), "two-pass.ipa")
-	if err := store.applyPatches(item, account, src, combined, []byte("artwork")); err != nil {
+	if err := store.applyPatches(item, account, src, combined, []byte("artwork"), false); err != nil {
 		t.Fatal(err)
 	}
 	bare := item
 	bare.Sinfs = nil
-	if err := store.applyPatches(bare, account, src, old, []byte("artwork")); err != nil {
+	if err := store.applyPatches(bare, account, src, old, []byte("artwork"), false); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.ReplicateSinf(ReplicateSinfInput{PackagePath: old, Sinfs: item.Sinfs}); err != nil {
@@ -140,13 +140,13 @@ func BenchmarkDownloadPersonalization(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				if combined {
-					if err := store.applyPatches(item, account, src, output, nil); err != nil {
+					if err := store.applyPatches(item, account, src, output, nil, false); err != nil {
 						b.Fatal(err)
 					}
 				} else {
 					bare := item
 					bare.Sinfs = nil
-					if err := store.applyPatches(bare, account, src, output, nil); err != nil {
+					if err := store.applyPatches(bare, account, src, output, nil, false); err != nil {
 						b.Fatal(err)
 					}
 					if err := store.ReplicateSinf(ReplicateSinfInput{PackagePath: output, Sinfs: item.Sinfs}); err != nil {

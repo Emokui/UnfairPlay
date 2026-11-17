@@ -1,8 +1,11 @@
 package cmd
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/avast/retry-go"
@@ -20,6 +23,9 @@ func downloadCmd() *cobra.Command {
 func downloadCmdWithAppStore(appStore func() appstore.AppStore) *cobra.Command {
 	var (
 		acquireLicense    bool
+		checkLicense      bool
+		noUpdate          bool
+		expectedAccount   string
 		outputPath        string
 		appID             int64
 		bundleID          string
@@ -47,20 +53,45 @@ func downloadCmdWithAppStore(appStore func() appstore.AppStore) *cobra.Command {
 			}
 
 			acc := infoResult.Account
+			if expectedAccount != "" && !strings.EqualFold(strings.TrimSpace(expectedAccount), strings.TrimSpace(acc.Email)) {
+				return errors.New("download account does not match selected profile")
+			}
+			if checkLicense {
+				if appID == 0 {
+					return errors.New("checking the license requires an app ID")
+				}
+				_, err := store.Download(appstore.DownloadInput{
+					CheckLicenseOnly: true,
+					Context:          cmd.Context(),
+					Account:          acc,
+					App:              appstore.App{ID: appID},
+					Platform:         platform,
+					OnStage:          newStageReporter(),
+				})
+				if err != nil && !errors.Is(err, appstore.ErrLicenseRequired) {
+					return err
+				}
+				dependencies.Logger.Log().Bool("owned", err == nil).Bool("success", true).Send()
+				return nil
+			}
 			var lastErr error
 			purchaseRequired := false
 			purchased := false
+			refreshed := false
+			interactive, _ := cmd.Context().Value(interactiveKey).(bool)
 
+			stage := newStageReporter()
 			return retry.Do(func() error {
 				if errors.Is(lastErr, appstore.ErrPasswordTokenExpired) {
-					loginResult, err := store.Login(appstore.LoginInput{
-						Email:    acc.Email,
-						Password: acc.Password,
-					})
+					refreshed = true
+					stage("正在更新 Apple 登录会话")
+					loginResult, err := refreshDownloadLogin(cmd.Context(), store, acc, interactive)
 					if err != nil {
-						return err
+						return fmt.Errorf("failed to refresh Apple login: %w", err)
 					}
-
+					if expectedAccount != "" && !strings.EqualFold(strings.TrimSpace(expectedAccount), strings.TrimSpace(loginResult.Account.Email)) {
+						return errors.New("download account does not match selected profile after refreshing sign-in")
+					}
 					acc = loginResult.Account
 				}
 
@@ -87,12 +118,17 @@ func downloadCmdWithAppStore(appStore func() appstore.AppStore) *cobra.Command {
 				}
 
 				if purchaseRequired {
+					stage("正在获取免费应用许可")
 					err := store.Purchase(appstore.PurchaseInput{
+						Context:  cmd.Context(),
 						Account:  acc,
 						App:      app,
 						Platform: platform,
 					})
 					if err != nil && !errors.Is(err, appstore.ErrLicenseAlreadyExists) {
+						if refreshed && errors.Is(err, appstore.ErrPasswordTokenExpired) {
+							return fmt.Errorf("free app license rejected after sign-in refresh: %w", err)
+						}
 						return err
 					}
 					purchaseRequired = false
@@ -102,7 +138,6 @@ func downloadCmdWithAppStore(appStore func() appstore.AppStore) *cobra.Command {
 						Msg("purchase")
 				}
 
-				interactive, _ := cmd.Context().Value(interactiveKey).(bool)
 				var progress *progressbar.ProgressBar
 				if interactive {
 					progress = progressbar.NewOptions64(1,
@@ -115,21 +150,21 @@ func downloadCmdWithAppStore(appStore func() appstore.AppStore) *cobra.Command {
 						progressbar.OptionShowCount(),
 						progressbar.OptionClearOnFinish(),
 						progressbar.OptionSpinnerType(14),
-						progressbar.OptionSetRenderBlankState(true),
 						progressbar.OptionSetElapsedTime(false),
 						progressbar.OptionSetPredictTime(false),
 					)
 				}
 
 				out, err := store.Download(appstore.DownloadInput{
-					OnStage:           newStageReporter(),
-					Context:           cmd.Context(),
-					Account:           acc,
-					App:               app,
-					OutputPath:        outputPath,
-					Progress:          progress,
-					ExternalVersionID: externalVersionID,
-					Platform:          platform,
+					OnStage:            stage,
+					Context:            cmd.Context(),
+					Account:            acc,
+					App:                app,
+					OutputPath:         outputPath,
+					Progress:           progress,
+					ExternalVersionID:  externalVersionID,
+					Platform:           platform,
+					OmitUpdateMetadata: noUpdate,
 				})
 				if err != nil {
 					return err
@@ -155,10 +190,10 @@ func downloadCmdWithAppStore(appStore func() appstore.AppStore) *cobra.Command {
 					lastErr = err
 
 					if errors.Is(err, appstore.ErrPasswordTokenExpired) {
-						return true
+						return !refreshed
 					}
 
-					if errors.Is(err, appstore.ErrLicenseRequired) && acquireLicense {
+					if errors.Is(err, appstore.ErrLicenseRequired) && acquireLicense && !purchased {
 						return true
 					}
 
@@ -173,9 +208,33 @@ func downloadCmdWithAppStore(appStore func() appstore.AppStore) *cobra.Command {
 	cmd.Flags().StringVarP(&outputPath, "output", "o", "", "The destination path of the downloaded app package")
 	cmd.Flags().StringVar(&externalVersionID, "external-version-id", "", "External version identifier of the target app (defaults to latest version when not specified)")
 	cmd.Flags().StringVar(&platformValue, "platform", "", "Platform to download for: iphone (iOS), ipad (iPadOS), appletv (tvOS), watchos, visionos, or macos")
+	cmd.Flags().StringVar(&expectedAccount, "expected-account", "", "Expected account identity for the selected desktop profile")
 	cmd.Flags().BoolVar(&acquireLicense, "purchase", false, "Obtain a license for the app if needed")
+	cmd.Flags().BoolVar(&checkLicense, "check-license", false, "Check the account's license without downloading or acquiring the app")
+	cmd.Flags().BoolVar(&noUpdate, "no-update", false, "Omit the App Store update metadata from the saved IPA")
 
 	return cmd
+}
+
+func refreshDownloadLogin(ctx context.Context, store appstore.AppStore, account appstore.Account, interactive bool) (appstore.LoginOutput, error) {
+	input := appstore.LoginInput{Context: ctx, Email: account.Email, Password: account.Password}
+	if input.Password == "" && interactive {
+		password, err := readPrompt("enter password: ", true)
+		if err != nil {
+			return appstore.LoginOutput{}, err
+		}
+		input.Password = password
+	}
+	output, err := store.Login(input)
+	if !interactive || !canProvideVerificationCode(err) {
+		return output, err
+	}
+	code, err := readVerificationCode(err)
+	if err != nil {
+		return appstore.LoginOutput{}, err
+	}
+	input.AuthCode = code
+	return store.Login(input)
 }
 
 type sinfReplicator interface {

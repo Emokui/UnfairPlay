@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/majd/ipatool/v2/internal/progress"
 	"io"
 	"net/http"
 	"os"
@@ -99,6 +100,7 @@ func ensureLibrary(ctx context.Context, root string, selected artifact, client *
 		return "", fmt.Errorf("create Unicorn cache: %w", err)
 	}
 
+	progress.Report(ctx, "正在下载认证运行库")
 	archive, err := downloadArtifact(ctx, directory, selected, client)
 	if err != nil {
 		return "", err

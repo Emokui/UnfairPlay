@@ -5,6 +5,7 @@ package unicorn
 import (
 	"context"
 	"fmt"
+	"github.com/majd/ipatool/v2/internal/cachelock"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -36,6 +37,11 @@ func cachedRuntimePaths(ctx context.Context) (runtimePaths, error) {
 	}
 
 	root := filepath.Join(cache, "ipatool", "unicorn", unicornVersion)
+	unlock, err := cachelock.Acquire(ctx, filepath.Join(root, ".prepare.lock"))
+	if err != nil {
+		return runtimePaths{}, err
+	}
+	defer unlock()
 	paths := runtimePaths{dependencies: make([]string, 0, len(selected.dependencies))}
 
 	for _, dependency := range selected.dependencies {

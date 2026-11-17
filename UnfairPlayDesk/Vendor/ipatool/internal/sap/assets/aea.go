@@ -92,14 +92,22 @@ type aeaSegment struct {
 }
 
 type aeaReader struct {
-	source      io.ReaderAt
-	size        int64
-	segmentSize uint32
-	mainKey     []byte
-	segments    []aeaSegment
-	cache       map[int][]byte
-	cacheOrder  []int
-	cacheMu     sync.Mutex
+	source         io.ReaderAt
+	size           int64
+	segmentSize    uint32
+	mainKey        []byte
+	segments       []aeaSegment
+	cache          map[int][]byte
+	cacheOrder     []int
+	cacheMu        sync.Mutex
+	indexMu        sync.Mutex
+	ctx            context.Context
+	root           aeaRootHeader
+	sourceSize     int64
+	indexOffset    int64
+	indexMAC       aeaMAC
+	indexedOutput  uint64
+	indexedCluster uint32
 }
 
 type fcsResponse struct {
@@ -108,6 +116,15 @@ type fcsResponse struct {
 }
 
 func newAEAReader(ctx context.Context, client *http.Client, source io.ReaderAt, sourceSize int64) (*aeaReader, error) {
+	return openAEAReader(ctx, client, source, sourceSize, false)
+}
+
+// Extraction indexes only the authenticated prefix needed by each read.
+func newLazyAEAReader(ctx context.Context, client *http.Client, source io.ReaderAt, sourceSize int64) (*aeaReader, error) {
+	return openAEAReader(ctx, client, source, sourceSize, true)
+}
+
+func openAEAReader(ctx context.Context, client *http.Client, source io.ReaderAt, sourceSize int64, lazy bool) (*aeaReader, error) {
 	var header aeaHeader
 	if err := readBinaryAt(source, 0, &header); err != nil {
 		return nil, fmt.Errorf("read AEA header: %w", err)
@@ -208,8 +225,12 @@ func newAEAReader(ctx context.Context, client *http.Client, source io.ReaderAt, 
 	}
 
 	clusterOffset := rootOffset + int64(binary.Size(encryptedRoot))
-	if err := reader.indexClusters(clusterOffset, encryptedRoot.ClusterMAC, root, sourceSize); err != nil {
-		return nil, err
+	reader.ctx, reader.root, reader.sourceSize = ctx, root, sourceSize
+	reader.indexOffset, reader.indexMAC = clusterOffset, encryptedRoot.ClusterMAC
+	if !lazy {
+		if err := reader.ensureIndex(len(reader.segments) - 1); err != nil {
+			return nil, err
+		}
 	}
 
 	return reader, nil
@@ -343,14 +364,27 @@ func resolveAEASymmetricKey(ctx context.Context, client *http.Client, metadata m
 	return symmetricKey, nil
 }
 
-func (r *aeaReader) indexClusters(offset int64, clusterMAC aeaMAC, root aeaRootHeader, sourceSize int64) error {
+func (r *aeaReader) ensureIndex(target int) error {
+	r.indexMu.Lock()
+	defer r.indexMu.Unlock()
+	if r.segments[target].decompressedSize != 0 {
+		return nil
+	}
+	offset, clusterMAC, root, sourceSize := r.indexOffset, r.indexMAC, r.root, r.sourceSize
 	const segmentHeaderSize = 8 + sha256.Size
 
 	headerSize := int64(segmentHeaderSize*root.SegmentsPerCluster + sha256.Size + sha256.Size*root.SegmentsPerCluster)
-	outputSize := uint64(0)
-	clusterIndex := uint32(0)
+	outputSize := r.indexedOutput
+	clusterIndex := r.indexedCluster
 
-	for outputSize < root.FileSize {
+	for outputSize < root.FileSize && r.segments[target].decompressedSize == 0 {
+		if err := r.ctx.Err(); err != nil {
+			return fmt.Errorf("index Apple image: %w", err)
+		}
+		if clusterIndex%16 == 0 {
+			total := (root.FileSize + uint64(root.SegmentSize)*uint64(root.SegmentsPerCluster) - 1) / (uint64(root.SegmentSize) * uint64(root.SegmentsPerCluster))
+			reportProgress(r.ctx, fmt.Sprintf("正在索引 Apple 镜像：%d/%d", clusterIndex, total))
+		}
 		if offset < 0 || headerSize > sourceSize-offset {
 			return errors.New("AEA cluster header extends beyond the encrypted image")
 		}
@@ -390,6 +424,7 @@ func (r *aeaReader) indexClusters(offset int64, clusterMAC aeaMAC, root aeaRootH
 		}
 
 		dataOffset := offset + headerSize
+		var pending []aeaSegment
 		for segmentIndex := range root.SegmentsPerCluster {
 			start := int(segmentIndex) * segmentHeaderSize
 			var segmentHeader aeaSegmentHeader
@@ -426,7 +461,7 @@ func (r *aeaReader) indexClusters(offset int64, clusterMAC aeaMAC, root aeaRootH
 				return fmt.Errorf("AEA cluster %d segment %d extends beyond the declared output", clusterIndex, segmentIndex)
 			}
 
-			r.segments[globalIndex] = aeaSegment{
+			pending = append(pending, aeaSegment{
 				inputOffset:      dataOffset,
 				outputOffset:     outputOffset,
 				compressedSize:   segmentHeader.CompressedSize,
@@ -435,7 +470,7 @@ func (r *aeaReader) indexClusters(offset int64, clusterMAC aeaMAC, root aeaRootH
 				mac:              segmentMAC,
 				cluster:          clusterIndex,
 				index:            segmentIndex,
-			}
+			})
 
 			dataOffset += int64(segmentHeader.CompressedSize)
 			outputSize += uint64(segmentHeader.DecompressedSize)
@@ -444,12 +479,17 @@ func (r *aeaReader) indexClusters(offset int64, clusterMAC aeaMAC, root aeaRootH
 			}
 		}
 
+		for _, segment := range pending {
+			r.segments[segment.outputOffset/int64(r.segmentSize)] = segment
+		}
 		offset = dataOffset
 		clusterMAC = nextClusterMAC
 		clusterIndex++
+		r.indexOffset, r.indexMAC = offset, clusterMAC
+		r.indexedOutput, r.indexedCluster = outputSize, clusterIndex
 	}
 
-	if outputSize != root.FileSize {
+	if outputSize >= root.FileSize && outputSize != root.FileSize {
 		return fmt.Errorf("AEA segment data has size %d, expected %d", outputSize, root.FileSize)
 	}
 
@@ -481,6 +521,9 @@ func (r *aeaReader) ReadAt(data []byte, offset int64) (int, error) {
 			return written, errors.New("AEA segment index is incomplete")
 		}
 
+		if err := r.ensureIndex(segmentIndex); err != nil {
+			return written, err
+		}
 		segment := r.segments[segmentIndex]
 		if segment.decompressedSize == 0 {
 			return written, fmt.Errorf("AEA segment %d is missing", segmentIndex)

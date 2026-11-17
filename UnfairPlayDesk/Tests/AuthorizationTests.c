@@ -31,9 +31,12 @@ int main(int argc,char **argv){
     assert(!configureInvokingUser(0));assert(configureInvokingUser(getuid()));
     assert(strtoul(getenv("SUDO_UID"),NULL,10)==getuid());assert(strtoul(getenv("SUDO_GID"),NULL,10)==getgid());
     char path[]="/private/tmp/desk-helper-test-XXXXXX";assert(mkdtemp(path));snprintf(testHome,sizeof(testHome),"%s",path);
-    char model[4096],app[4096],ipa[4096];
+    char model[4096],app[4096],ipa[4096],stage[4096];
     snprintf(model,sizeof(model),"%s/Library/Application Support/UnfairPlayDesk/Models/11111111-1111-1111-1111-111111111111",path);
-    snprintf(app,sizeof(app),"%s/Applications/Test.app",path);snprintf(ipa,sizeof(ipa),"%s/Test.ipa",path);dirs(model);dirs(app);
+    snprintf(app,sizeof(app),"%s/Applications/Test.app",path);
+    snprintf(stage,sizeof(stage),"%s/Library/Application Support/UnfairPlayDesk/.unfairplay-work-22222222-2222-2222-2222-222222222222",path);
+    snprintf(ipa,sizeof(ipa),"%s/result.ipa",stage);
+    dirs(model);dirs(app);dirs(stage);
     int fd=open(ipa,O_CREAT|O_WRONLY,0600);assert(fd>=0);close(fd);
     char *valid[]={"setup","--app",app,"--ipa",ipa,"--model-dir",model};
     assert(validateSetup(7,valid,getuid()));assert(!validateSetup(6,valid,getuid()));

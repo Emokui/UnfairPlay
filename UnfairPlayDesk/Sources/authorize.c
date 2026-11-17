@@ -1,5 +1,4 @@
 #include <Security/Security.h>
-#include <Security/Authorization.h>
 #include <Security/SecStaticCode.h>
 #include <CommonCrypto/CommonDigest.h>
 #include <sys/stat.h>
@@ -13,6 +12,7 @@
 #include <limits.h>
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <mach-o/dyld.h>
 
 #ifndef UNFAIRPLAY_SHA256
@@ -46,7 +46,17 @@ static int validateSetup(int argc, char **args, uid_t uid) {
     char userApps[PATH_MAX]; snprintf(userApps,sizeof(userApps),"%s/Applications/",pw->pw_dir);
     if(strncmp(app,"/Applications/",14)&&strncmp(app,userApps,strlen(userApps)))return 0;
     size_t length=strlen(app); if(length<4||strcmp(app+length-4,".app"))return 0;
-    length=strlen(ipa); if(length<4||strcasecmp(ipa+length-4,".ipa"))return 0;
+    // The app reads the user-selected file before requesting authorization.
+    // The helper accepts only its private, canonical staging copy.
+    char stagePrefix[PATH_MAX];
+    snprintf(stagePrefix,sizeof(stagePrefix),"%s/Library/Application Support/UnfairPlayDesk/.unfairplay-work-",pw->pw_dir);
+    size_t prefixLength=strlen(stagePrefix);
+    if(strcmp(ipa,args[4]) || strncmp(ipa,stagePrefix,prefixLength))return 0;
+    const char *stage=ipa+prefixLength;
+    if(strlen(stage)<36 || strcmp(stage+36,"/result.ipa"))return 0;
+    char stageID[37];
+    memcpy(stageID,stage,36); stageID[36]=0;
+    if(!validUUID(stageID))return 0;
     if(stat(ipa,&state)||!S_ISREG(state.st_mode)||state.st_uid!=uid)return 0;
     return 1;
 }
@@ -83,6 +93,16 @@ static int runRoot(const char *tool, char **args, pid_t parent) {
     return WIFEXITED(status)?WEXITSTATUS(status):128+WTERMSIG(status);
 }
 #ifndef DESK_ROOT_ONLY
+static char *shellQuote(const char *value) {
+    size_t length=strlen(value); char *quoted=malloc(length*4+3), *out=quoted;
+    if(!quoted)return NULL;
+    *out++='\'';
+    for(const char *p=value;*p;p++){
+        if(*p=='\''){ memcpy(out,"'\\''",4); out+=4; }
+        else *out++=*p;
+    }
+    *out++='\'';*out=0;return quoted;
+}
 static const char *authScript(void) {
     static const char script[] =
         "set -eu\nexec 2>&1\numask 077\n"
@@ -123,22 +143,47 @@ int main(int argc,char **argv){
     if(snprintf(rootHelper,sizeof(rootHelper),"%s/root-helper",resolved)>=(int)sizeof(rootHelper)||!trustedBinary(rootHelper,ROOT_HELPER_SHA256)){
         fprintf(stderr,"管理员辅助工具完整性检查失败。\n");return 2;
     }
-    AuthorizationRef auth; OSStatus status=AuthorizationCreate(NULL,kAuthorizationEmptyEnvironment,kAuthorizationFlagDefaults,&auth);
-    if(status!=errAuthorizationSuccess)return 1;
+    char workspace[]="/private/tmp/unfairplay-launch-XXXXXX",fifo[PATH_MAX];
+    if(!mkdtemp(workspace))return 1;
+    snprintf(fifo,sizeof(fifo),"%s/output",workspace);
+    if(mkfifo(fifo,0600)){rmdir(workspace);return 1;}
+    int stream=open(fifo,O_RDWR|O_NONBLOCK|O_NOFOLLOW);
+    if(stream<0){unlink(fifo);rmdir(workspace);return 1;}
     char uid[32],pid[32];snprintf(uid,sizeof(uid),"%u",getuid());snprintf(pid,sizeof(pid),"%d",getpid());
-    // Authorization executes a system-owned launcher with an empty environment,
-    // never a mutable user-owned
-    // executable. All path values are positional arguments, not script text.
-    char *args[]={"-i","PATH=/usr/bin:/bin:/usr/sbin:/sbin","/bin/sh","-p","-c",(char *)authScript(),"--",pid,uid,resolved,argv[3],argv[5],argv[7],NULL};
-    FILE *pipe=NULL; status=AuthorizationExecuteWithPrivileges(auth,"/usr/bin/env",kAuthorizationFlagDefaults,args,&pipe);
-    if(status!=errAuthorizationSuccess){fprintf(stderr,"管理员授权未完成（%d）\n",(int)status);AuthorizationFree(auth,0);return 1;}
-    char buffer[4096],tail[16384]={0};size_t used=0,n;
-    while((n=fread(buffer,1,sizeof(buffer),pipe))>0){
-        fwrite(buffer,1,n,stdout);fflush(stdout);
-        if(used+n>=sizeof(tail)){memmove(tail,tail+used-4096,4096);used=4096;}
-        memcpy(tail+used,buffer,n);used+=n;tail[used]=0;
+    const char *values[]={"/usr/bin/env","-i","PATH=/usr/bin:/bin:/usr/sbin:/sbin","/bin/sh","-p","-c",authScript(),"--",pid,uid,resolved,argv[3],argv[5],argv[7],NULL};
+    char *quoted[16]={0},*output=shellQuote(fifo);size_t capacity=64;int count=0;
+    if(!output){close(stream);unlink(fifo);rmdir(workspace);return 1;}
+    capacity+=strlen(output);
+    for(;values[count];count++){
+        quoted[count]=shellQuote(values[count]);
+        if(!quoted[count]){for(int j=0;j<count;j++)free(quoted[j]);free(output);close(stream);unlink(fifo);rmdir(workspace);return 1;}
+        capacity+=strlen(quoted[count])+1;
     }
-    fclose(pipe);AuthorizationFree(auth,0);
+    char *command=calloc(capacity,1);
+    if(!command){for(int j=0;j<count;j++)free(quoted[j]);free(output);close(stream);unlink(fifo);rmdir(workspace);return 1;}
+    for(int j=0;j<count;j++){strcat(command,quoted[j]);strcat(command," ");free(quoted[j]);}
+    strcat(command,"> ");strcat(command,output);strcat(command," 2>&1");free(output);
+    // The system-owned interpreter requests administrator authorization. The
+    // root command remains inline and all user paths are shell-quoted arguments.
+    const char *appleScript="on run argv\n do shell script (item 1 of argv) with administrator privileges\nend run";
+    pid_t launcher=fork();
+    if(launcher==0){close(stream);execl("/usr/bin/osascript","osascript","-e",appleScript,"--",command,NULL);_exit(127);}
+    free(command);
+    if(launcher<0){close(stream);unlink(fifo);rmdir(workspace);return 1;}
+    char buffer[4096],tail[16384]={0};size_t used=0;int ended=0,status=0;
+    while(1){
+        ssize_t n=read(stream,buffer,sizeof(buffer));
+        if(n>0){
+            fwrite(buffer,1,(size_t)n,stdout);fflush(stdout);
+            if(used+(size_t)n>=sizeof(tail)){memmove(tail,tail+used-4096,4096);used=4096;}
+            memcpy(tail+used,buffer,(size_t)n);used+=(size_t)n;tail[used]=0;
+            continue;
+        }
+        if(!ended){pid_t done=waitpid(launcher,&status,WNOHANG);ended=done==launcher||(done<0&&errno!=EINTR);}
+        if(ended)break;
+        usleep(50000);
+    }
+    close(stream);unlink(fifo);rmdir(workspace);
     const char *marker="\nUNFAIRPLAY_DESK_EXIT_STATUS:";char *last=NULL,*p=tail;
     while((p=strstr(p,marker))){last=p;p++;}
     if(!last)return 1;

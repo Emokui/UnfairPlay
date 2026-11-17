@@ -47,6 +47,7 @@ type entryPoints struct {
 }
 
 type Machine struct {
+	ctx           context.Context
 	engine        *unicorn.Engine
 	arm64         *arm64Compatibility
 	services      *shims
@@ -112,7 +113,7 @@ func openRuntime(ctx context.Context, bundle assets.Bundle, options runtimeOptio
 	images := make(map[string]*machimage.Image, len(imageSpecs))
 
 	for _, spec := range imageSpecs {
-		image, err := machimage.Open(spec.name, spec.data)
+		image, err := machimage.OpenShared(spec.name, spec.data)
 		if err != nil {
 			return nil, nil, fmt.Errorf("open %s image: %w", spec.name, err)
 		}
@@ -159,7 +160,7 @@ func openRuntime(ctx context.Context, bundle assets.Bundle, options runtimeOptio
 		return nil, nil, fmt.Errorf("create Unicorn engine: %w", err)
 	}
 
-	machine := &Machine{engine: engine, arm64: newARM64Compatibility(engine)}
+	machine := &Machine{ctx: ctx, engine: engine, arm64: newARM64Compatibility(engine)}
 	ready := false
 
 	defer func() {
@@ -544,9 +545,25 @@ func (m *Machine) invoke(function uint64, arguments ...uint64) (uint64, error) {
 	// counts. Bound execution by wall time without rejecting legitimate work on
 	// slower machines for crossing a fixed instruction limit.
 	next := function
+	deadline := time.Now().Add(sapGuestTimeout)
+	if m.ctx != nil {
+		if requestDeadline, ok := m.ctx.Deadline(); ok && requestDeadline.Before(deadline) {
+			deadline = requestDeadline
+		}
+	}
 
 	for {
-		executionErr := m.engine.StartBounded(next, returnAddress, sapGuestTimeout, 0)
+		if m.ctx != nil && m.ctx.Err() != nil {
+			return 0, m.ctx.Err()
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return 0, fmt.Errorf("SAP guest execution deadline: %w", context.DeadlineExceeded)
+		}
+		executionErr := m.engine.StartBounded(next, returnAddress, remaining, 0)
+		if m.ctx != nil && m.ctx.Err() != nil {
+			return 0, m.ctx.Err()
+		}
 		if executionErr == nil {
 			break
 		}

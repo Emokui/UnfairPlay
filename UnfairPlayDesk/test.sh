@@ -3,6 +3,7 @@ set -eu
 umask 077
 cd -- "${0:A:h}"
 mkdir -p build
+export MACOSX_DEPLOYMENT_TARGET=14.0
 APP="${1:-$PWD/../UnfairPlay.app}"
 if [[ $# -eq 0 && ! -d "$APP" ]]; then APP="/Applications/UnfairPlay.app"; fi
 TOOL="$APP/Contents/Resources/Tools/unfairplay"
@@ -18,5 +19,5 @@ if [[ ! -x "$GO_TOOL" ]]; then GO_TOOL="$(command -v go)"; fi
  cd Vendor/ipatool
  CLANG_MODULE_CACHE_PATH="$PROJECT_DIR/build/clang-cache" GOCACHE="$PROJECT_DIR/build/go-cache" GOMODCACHE="$PROJECT_DIR/build/go-mod" "$GO_TOOL" build -o "$PROJECT_DIR/build/GoInputTest" "$PROJECT_DIR/Tests/GoInput/main.go"
 )
-xcrun swiftc -D DESK_TESTING -swift-version 5 -parse-as-library Sources/Core.swift Sources/Jobs.swift Sources/Runner.swift Sources/AccountStore.swift Tests/RunnerTests.swift -o build/RunnerTests -framework AppKit -framework Security -module-cache-path build/module-cache
+xcrun swiftc -target arm64-apple-macos14.0 -D DESK_TESTING -swift-version 5 -parse-as-library Sources/StorefrontRegions.swift Sources/DownloadCatalog.swift Sources/Core.swift Sources/Jobs.swift Sources/Runner.swift Sources/AccountStore.swift Tests/RunnerTests.swift -o build/RunnerTests -framework AppKit -framework Security -module-cache-path build/module-cache
 DESK_WORKER="$PWD/build/worker" DESK_MODELCHECK="$APP/Contents/Resources/Tools/modelcheck" ./build/RunnerTests

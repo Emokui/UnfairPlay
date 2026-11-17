@@ -139,26 +139,7 @@ func readMachOProbe(file *zip.File) ([]byte, error) {
 	}
 	magic := binary.LittleEndian.Uint32(header[:4])
 	if magic == mhMagic32 || magic == mhMagic64 {
-		headerBytes := 28
-		if magic == mhMagic64 {
-			headerBytes = 32
-		}
-		if len(header) < headerBytes {
-			return header, nil
-		}
-		commandsBytes := int(binary.LittleEndian.Uint32(header[20:24]))
-		required := headerBytes + commandsBytes
-		if required < headerBytes || required > 1024*1024 || uint64(required) > file.UncompressedSize64 {
-			return header, fmt.Errorf("Mach-O load-command extent is invalid")
-		}
-		probe := make([]byte, required)
-		copy(probe, header)
-		if required > len(header) {
-			if _, err := io.ReadFull(reader, probe[len(header):]); err != nil {
-				return probe, err
-			}
-		}
-		return probe, nil
+		return readThinMachOProbe(reader, header, file.UncompressedSize64)
 	}
 	if isFatMachO(header) {
 		remainder, err := io.ReadAll(reader)

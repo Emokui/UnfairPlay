@@ -8,6 +8,7 @@ import (
 	gohttp "net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/majd/ipatool/v2/pkg/http"
 )
@@ -48,16 +49,24 @@ func (t *appstore) sendDownloadProduct(ctx context.Context, acc Account, app App
 	// Prefer ent/download when its generator and bag endpoint are available.
 	// Keep the fetched bag for the legacy chain if this attempt cannot serve
 	// the requested app; asset, network, and response failures can fall back.
-	var bag *urlBag
+	var (
+		bag             *urlBag
+		initialBagError error
+	)
 
 	if t.kbsyncGenerator != nil {
-		fetched, err := t.fetchURLBag(guid)
+		reportDownloadStage(ctx, "正在读取 Apple 下载配置")
+		fetched, err := t.fetchURLBagContext(ctx, guid)
+		initialBagError = err
 		if err == nil {
 			bag = &fetched
 			if bag.EntDownloadEndpoint != "" {
 				res, resolvedPlatform, err := t.sendPreferredDownload(ctx, bag.EntDownloadEndpoint, acc, app, guid, externalVersionID, platform)
 				if err == nil {
 					return res, resolvedPlatform, nil
+				}
+				if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+					return res, resolvedPlatform, err
 				}
 			}
 		}
@@ -67,11 +76,12 @@ func (t *appstore) sendDownloadProduct(ctx context.Context, acc Account, app App
 		return http.Result[downloadResult]{}, platform, fmt.Errorf("download request canceled: %w", err)
 	}
 
+	reportDownloadStage(ctx, "正在请求备用下载接口")
 	volumeStore := t.volumeStoreEndpoint(acc)
 
 	res, err := t.sendCommerceDownloadRequest(ctx, t.downloadProductRequest(volumeStore, acc, app, guid, externalVersionID), guid)
 	if err != nil {
-		return res, platform, fmt.Errorf("failed to send http request: %w", err)
+		return res, platform, fmt.Errorf("failed to send http request: %w", errors.Join(initialBagError, err))
 	}
 
 	if !isEmptyDownloadProductResponse(res) && !isUnavailableDownloadProductResponse(res) {
@@ -81,9 +91,9 @@ func (t *appstore) sendDownloadProduct(ctx context.Context, acc Account, app App
 	// Try redownload when volumeStore returns no items, either silently or
 	// with the message-only "No Longer Available" response.
 	if bag == nil {
-		fetched, err := t.fetchURLBag(guid)
+		fetched, err := t.fetchURLBagContext(ctx, guid)
 		if err != nil {
-			return res, platform, fmt.Errorf("failed to get bag for redownload fallback: %w", err)
+			return res, platform, fmt.Errorf("failed to get bag for redownload fallback: %w", errors.Join(initialBagError, err))
 		}
 
 		bag = &fetched
@@ -119,6 +129,7 @@ func (t *appstore) sendDownloadProduct(ctx context.Context, acc Account, app App
 		}
 	}
 
+	reportDownloadStage(ctx, "正在请求已购应用下载地址")
 	redownloadRes, err := t.sendCommerceDownloadRequest(ctx, t.downloadProductRequest(redownload, acc, app, guid, externalVersionID), guid)
 	if bag.UpdateEndpoint != "" && externalVersionID != "" &&
 		(platform == "" || platform == PlatformIPhone || platform == PlatformIPad || platform == PlatformMacOS || platform == PlatformAppleTV || platform == PlatformWatchOS) &&
@@ -140,17 +151,8 @@ func (t *appstore) sendDownloadProduct(ctx context.Context, acc Account, app App
 }
 
 func (t *appstore) sendUnpinnedRedownload(ctx context.Context, endpoint downloadProductEndpoint, acc Account, app App, guid string) (http.Result[downloadResult], error) {
-	requestContext, cancel := context.WithTimeout(ctx, http.DefaultAuthenticationTimeout)
-	defer cancel()
-
-	if err := requestContext.Err(); err != nil {
-		return http.Result[downloadResult]{}, fmt.Errorf("redownload request canceled: %w", err)
-	}
-
 	request := t.downloadProductRequest(endpoint, acc, app, guid, "")
-	request.Context = requestContext
-
-	res, err := t.sendCommerceDownloadRequest(requestContext, request, guid)
+	res, err := t.sendCommerceDownloadRequest(ctx, request, guid)
 	if err != nil {
 		return res, fmt.Errorf("failed to send redownload request: %w", err)
 	}
@@ -191,13 +193,19 @@ func (t *appstore) sendUpdateProductContext(ctx context.Context, endpoint string
 }
 
 func (t *appstore) sendCommerceDownloadRequest(ctx context.Context, request http.Request, guid string) (http.Result[downloadResult], error) {
+	if err := ctx.Err(); err != nil {
+		return http.Result[downloadResult]{}, err
+	}
+	reportDownloadStage(ctx, "正在生成商店验证信息")
 	if t.authBackend != nil {
 		hardwareID, err := hex.DecodeString(guid)
 		if err != nil || len(hardwareID) != 6 {
 			return http.Result[downloadResult]{}, errors.New("store download requires a six-byte device GUID")
 		}
 
-		proof, err := t.storeAMDProof(ctx, request.URL, hardwareID)
+		proofContext, cancel := context.WithTimeout(ctx, time.Minute)
+		proof, err := t.storeAMDProof(proofContext, request.URL, hardwareID)
+		cancel()
 		if err != nil {
 			return http.Result[downloadResult]{}, err
 		}
@@ -207,6 +215,10 @@ func (t *appstore) sendCommerceDownloadRequest(ctx context.Context, request http
 		}
 	}
 
+	reportDownloadStage(ctx, "正在向 Apple 请求下载地址")
+	requestContext, cancel := context.WithTimeout(ctx, http.DefaultAuthenticationTimeout)
+	defer cancel()
+	request.Context = requestContext
 	result, err := t.downloadClient.Send(request)
 	if err != nil {
 		return result, fmt.Errorf("send Store commerce request: %w", err)

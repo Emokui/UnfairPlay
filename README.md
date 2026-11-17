@@ -1,67 +1,35 @@
-<p align="center"><img src="AppIcon.png" width="112" alt="UnfairPlay icon"></p>
+<p align="center"><img src="UnfairPlayDesk/Assets/AppIcon.png" width="112" alt="UnfairPlay 图标"></p>
 <h1 align="center">UnfairPlay</h1>
-<p align="center">简洁的原生 macOS IPA 静态脱壳工具</p>
+<p align="center">原生 macOS IPA 工作台</p>
 
 ## 下载与安装
 
-从 [Releases](https://github.com/Emokui/UnfairPlay/releases/latest) 下载 **UnfairPlay-1.4.0.dmg**，打开后将 **UnfairPlay** 拖入 **Applications**。
+从 [GitHub Releases](https://github.com/Emokui/UnfairPlay/releases) 下载已发布版本的 DMG。打开镜像后，将 **UnfairPlay.app** 拖入 **Applications**。安装包内置所需工具，使用时无需安装 Go。
 
-- Apple 芯片 Mac，macOS **27.0 或更新版本**。
-- 本版本为 ad-hoc 签名，未经过 Apple 开发者证书签名或公证。
-- 不需要另外安装 Go。已有账户和模型可继续使用。
-
-## 1.4.0 更新
-
-- 工具启动前的签名校验移至后台并在进程内复用；模型导入、回收和账户文件清理在后台执行，界面保持响应。
-- 下载缺少许可的免费应用时，会自动尝试获取许可；已有许可的免费和付费应用直接下载。不会自动购买付费应用。
-- 修复登录认证、下载 IPA、认证组件缓存与解密/模型验证性能，改进任务阶段进度显示。
-
-## 1.3.3 更新
-
-- 保存失败时可直接另存，无需重新下载或解密；支持跨磁盘保存，复制在后台执行。
-- 修复普通权限模型文件的导入；导入后在私有目录完整校验。
-- 登录失败可继续原档案，重复添加待登录 ID 自动复用。
-- 底部状态栏显示认证阶段和输入提示，点击工作区自动收起操作记录。
-- 首次认证组件提取提速并复用缓存；构建默认从固定源码编译，补齐第三方许可。
+当前源码版本为 **1.5.7**，面向 Apple 芯片 Mac，最低部署目标为 macOS 14.0。系统版本和模型支持范围见[兼容性说明](UnfairPlayDesk/COMPATIBILITY.md)。
 
 ## 功能
 
-- 独立 Apple ID 档案、登录会话与模型切换。
-- 下载当前账户有权获取的 App Store 应用，并可尝试获取免费应用许可。
-- 初始化、导入、校验和删除账户模型。
-- 本机 IPA 解密与验证，输出另存，支持拖放文件。
-- 简洁侧栏、可折叠操作记录、系统浅色与深色外观。
+- 搜索 App Store 应用，切换地区，浏览历史版本并下载当前账户有许可的 IPA。
+- 分别管理各 Apple 账户的登录会话、商店地区和模型。
+- 批量选择本机 IPA，查看加密状态，解密或验证所选文件。
+- 管理默认下载目录，在 Finder 中定位 IPA 或通过 AirDrop 发送。
 
-账户及模型保存在 `~/Library/Application Support/UnfairPlayDesk/`。此处切换账户不会改变系统 Mac App Store 的登录账户。免费应用许可获取仍受 Apple 的账户地区与应用可用性限制；若自动获取不成功，请先在 App Store 手动获取后重试。下载付费应用需要当前 ID 已购买该应用。
+## 从源码构建
 
-## 使用流程
-
-1. 点击账户卡片右侧的 **＋**，添加 Apple ID 并按提示登录。
-2. 在下载页输入 App Store 链接或数字 ID，选择 IPA 保存位置。缺少许可的免费应用会自动尝试获取。
-3. 导入对应模型；或在初始化页选择已安装的兼容 iPhone/iPad 应用及匹配 IPA，按系统提示授权初始化。
-4. 在解密页选择 IPA，解密并保存，或仅验证。安装前仍需签名。
-
-账户和模型的管理操作在各自卡片右上角的 **…** 菜单中。
-
-## 源码与构建
-
-完整可编译源码直接位于仓库的 [UnfairPlayDesk/](UnfairPlayDesk/) 文件夹中，包含 SwiftUI 界面、C 进程工具、测试、图标、构建脚本和完整 Go 依赖源码；账户、模型和构建缓存不包含在内。源码 ZIP 也可从 [1.4.0 Releases](https://github.com/Emokui/UnfairPlay/releases/tag/v1.4.0) 下载。
-
-克隆仓库后，在项目目录运行以下命令。需要 Xcode Command Line Tools 和 Go 1.25 或更新版本：
+需要 Xcode Command Line Tools 和 Go 1.26.5 或更新版本。下载或克隆仓库后运行：
 
 ```sh
 cd UnfairPlayDesk
-chmod +x build.sh test.sh package-dmg.sh
 ./build.sh
 ./test.sh
 ./package-dmg.sh
 ```
 
-模型校验器使用与已验证引擎一致的上游版本 `41f064bfe0ef947e748b785b8ab62697a64bdbe6`。项目目录中的 `README.md` 包含实现、验证记录与限制说明。
+`build.sh` 在仓库根目录生成 `UnfairPlay.app`，`package-dmg.sh` 在同处生成版本化的 DMG。默认构建使用 ad-hoc 签名。构建参数及 Go 测试命令见[项目说明](UnfairPlayDesk/README.md#编译与测试)。
+
+SwiftUI 界面和 C 辅助工具在 [Sources](UnfairPlayDesk/Sources/)，回归代码在 [Tests](UnfairPlayDesk/Tests/)，随项目编译的 Go 源码在 [Vendor](UnfairPlayDesk/Vendor/)。
 
 ## 致谢与许可
 
-- [DrWhax/unfairplay](https://github.com/DrWhax/unfairplay)：核心模型与 IPA 处理工具。
-- [majd/ipatool](https://github.com/majd/ipatool)：App Store 下载与账户操作。
-
-第三方许可证和声明保留在项目的 `Licenses/` 与对应 `Vendor/` 目录，以及应用包的 `Contents/Resources/Licenses/` 中。
+IPA 处理工具来自 [DrWhax/unfairplay](https://github.com/DrWhax/unfairplay)，账户与下载工具基于 [majd/ipatool](https://github.com/majd/ipatool)。第三方许可及声明见 [Licenses](UnfairPlayDesk/Licenses/) 和各 Vendor 目录。

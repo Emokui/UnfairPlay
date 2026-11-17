@@ -8,6 +8,8 @@ struct Profile: Codable, Identifiable, Hashable {
     var appleID: String?
     var requestedAppleID: String?
     var deletionPending: Bool?
+    var storeFront: String?
+    var loginCleared: Bool?
 }
 
 final class Store: ObservableObject {
@@ -90,18 +92,28 @@ final class Store: ObservableObject {
             selected = profile.id; return profile
         } catch { self.error = error.localizedDescription; return nil }
     }
-    func bindIdentity(_ id: UUID, email: String) throws {
+    func bindIdentity(_ id: UUID, email: String, storeFront: String? = nil) throws {
         guard let index = profiles.firstIndex(where: { $0.id == id }) else { throw DeskError("账户档案不存在。") }
         let canonical = email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !canonical.isEmpty else { throw DeskError("未能读取真实 Apple 账户身份。") }
         if let expected = profiles[index].appleID {
             guard expected.lowercased() == canonical else { throw DeskError("登录账户与此档案绑定的 Apple ID 不一致，已阻止操作。请清除此账户登陆后使用 \(expected) 登录。") }
-            return
+        } else {
+            guard !profiles.contains(where: { $0.id != id && $0.appleID?.lowercased() == canonical }) else { throw DeskError("这个 Apple ID 已绑定其他档案，请切换到原档案使用。") }
         }
-        guard !profiles.contains(where: { $0.id != id && $0.appleID?.lowercased() == canonical }) else { throw DeskError("这个 Apple ID 已绑定其他档案，请切换到原档案使用。") }
         let previous = profiles[index]
         profiles[index].appleID = canonical
         profiles[index].requestedAppleID = nil
+        profiles[index].loginCleared = false
+        if let storeFront { profiles[index].storeFront = storeFront }
+        guard profiles[index] != previous else { return }
+        do { try save() } catch { profiles[index] = previous; throw error }
+    }
+    func markLoginCleared(_ id: UUID) throws {
+        guard let index = profiles.firstIndex(where: { $0.id == id }) else { return }
+        let previous = profiles[index]
+        profiles[index].loginCleared = true
+        profiles[index].storeFront = nil
         do { try save() } catch { profiles[index] = previous; throw error }
     }
     func markDeleting(_ id: UUID) throws {

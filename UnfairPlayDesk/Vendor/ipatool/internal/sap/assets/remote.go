@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 const (
@@ -31,12 +32,19 @@ var frameworkImagePaths = []string{
 }
 
 func resolveRemoteImage(ctx context.Context) (Bundle, error) {
-	client := &http.Client{}
+	client := &http.Client{Timeout: 45 * time.Second}
+	reportProgress(ctx, "正在读取 Apple 组件镜像")
 	remote, err := openRemoteFile(ctx, client)
 	if err != nil {
 		return Bundle{}, fmt.Errorf("resolve macOS %s (%s) frameworks: %w", macOSVersion, macOSBuild, err)
 	}
 
+	journal, err := openRangeJournal()
+	if err != nil {
+		return Bundle{}, fmt.Errorf("open Apple extraction cache: %w", err)
+	}
+	defer journal.Close()
+	remote.journal = journal
 	archive, err := zip.NewReader(remote, remote.size)
 	if err != nil {
 		return Bundle{}, fmt.Errorf("read macOS %s (%s) restore image: %w", macOSVersion, macOSBuild, err)
@@ -59,10 +67,12 @@ func resolveRemoteImage(ctx context.Context) (Bundle, error) {
 	defer os.RemoveAll(workspace)
 
 	frameworkDirectory := filepath.Join(workspace, "frameworks")
+	reportProgress(ctx, "正在提取 Apple 认证组件")
 	if err := extractFrameworkFiles(ctx, client, remote, fileSystemEntry, frameworkDirectory); err != nil {
 		return Bundle{}, err
 	}
 
+	reportProgress(ctx, "正在提取 Apple Store 运行组件")
 	appleMediaServicesPath := filepath.Join(frameworkDirectory, "AppleMediaServices")
 	if err := extractAppleMediaServices(ctx, client, remote, systemOSEntry, appleMediaServicesPath); err != nil {
 		return Bundle{}, fmt.Errorf("extract AppleMediaServices from macOS %s (%s): %w", macOSVersion, macOSBuild, err)
@@ -82,7 +92,10 @@ func resolveRemoteImage(ctx context.Context) (Bundle, error) {
 		files[spec.name] = data
 	}
 
-	bundle := bundleFrom(files)
+	bundle, err := compactBundle(bundleFrom(files))
+	if err != nil {
+		return Bundle{}, err
+	}
 	if err := validate(bundle); err != nil {
 		return Bundle{}, err
 	}
@@ -100,7 +113,7 @@ func extractAppleMediaServices(ctx context.Context, client *http.Client, remote 
 		return fmt.Errorf("locate encrypted SystemOS cryptex: %w", err)
 	}
 	encryptedImage := io.NewSectionReader(remote, offset, int64(entry.CompressedSize64))
-	image, err := newAEAReader(ctx, client, encryptedImage, int64(entry.CompressedSize64))
+	image, err := newLazyAEAReader(ctx, client, encryptedImage, int64(entry.CompressedSize64))
 	if err != nil {
 		return fmt.Errorf("open encrypted SystemOS cryptex: %w", err)
 	}
@@ -163,7 +176,7 @@ func extractFrameworkFiles(ctx context.Context, client *http.Client, remote *rem
 	}
 
 	encryptedImage := io.NewSectionReader(remote, offset, int64(entry.CompressedSize64))
-	image, err := newAEAReader(ctx, client, encryptedImage, int64(entry.CompressedSize64))
+	image, err := newLazyAEAReader(ctx, client, encryptedImage, int64(entry.CompressedSize64))
 	if err != nil {
 		return fmt.Errorf("open encrypted macOS filesystem: %w", err)
 	}

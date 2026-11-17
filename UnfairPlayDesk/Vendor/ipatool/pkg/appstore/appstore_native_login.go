@@ -6,11 +6,17 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
+	"github.com/majd/ipatool/v2/internal/sap/assets"
 	"github.com/majd/ipatool/v2/internal/storeauth"
 )
 
-const anisetteKeychainKey = "anisette-v4"
+const (
+	anisetteKeychainKey        = "anisette-v4"
+	loginRuntimeTimeout        = 5 * time.Minute
+	loginAuthenticationTimeout = 2 * time.Minute
+)
 
 func (t *appstore) nativeLogin(input LoginInput) (LoginOutput, error) {
 	t.authStateMu.Lock()
@@ -28,7 +34,7 @@ func (t *appstore) nativeLogin(input LoginInput) (LoginOutput, error) {
 	if err != nil {
 		return LoginOutput{}, err
 	}
-	ctx := context.Background()
+	ctx := assets.WithProgress(input.Context, report)
 	macAddress, err := t.machine.MacAddress()
 	if err != nil {
 		return LoginOutput{}, fmt.Errorf("get Store machine identity: %w", err)
@@ -37,14 +43,24 @@ func (t *appstore) nativeLogin(input LoginInput) (LoginOutput, error) {
 	if err != nil {
 		return LoginOutput{}, err
 	}
-	bag, err := t.bag(guid)
+	bag, err := t.bagContext(ctx, guid)
 	if err != nil {
 		return LoginOutput{}, fmt.Errorf("get Store authentication bag: %w", err)
 	}
-	authenticate := func() (LoginOutput, error) { return t.loginWithConfig(input, authCode, guid, hardwareID, bag) }
+	report("正在准备 Apple 认证组件")
+	if _, err := assets.Load(ctx); err != nil {
+		return LoginOutput{}, fmt.Errorf("prepare authentication components: %w", err)
+	}
+	authenticate := func() (LoginOutput, error) {
+		attempt, cancel := context.WithTimeout(ctx, loginAuthenticationTimeout)
+		defer cancel()
+		return t.loginWithContext(attempt, input, authCode, guid, hardwareID, bag)
+	}
+	prepare, cancelPrepare := context.WithTimeout(ctx, loginRuntimeTimeout)
+	defer cancelPrepare()
 	if len(t.anisetteState) != 0 {
 		report("正在复用本地设备认证状态")
-		proof, state, proofErr := storeauth.StoreAMDHeaders(ctx, t.anisetteState, bag.AuthEndpoint, hardwareID)
+		proof, state, proofErr := storeauth.StoreAMDHeaders(prepare, t.anisetteState, bag.AuthEndpoint, hardwareID)
 		if proofErr == nil {
 			if err = t.keychain.Set(anisetteKeychainKey, state); err != nil {
 				return LoginOutput{}, fmt.Errorf("save Apple authentication state: %w", err)
@@ -59,9 +75,16 @@ func (t *appstore) nativeLogin(input LoginInput) (LoginOutput, error) {
 			report("正在验证 Apple 账户")
 			return authenticate()
 		}
+		if err := prepare.Err(); err != nil {
+			return LoginOutput{}, fmt.Errorf("prepare cached Store AMD proof: %w", err)
+		}
+		if errors.Is(proofErr, context.DeadlineExceeded) || errors.Is(proofErr, context.Canceled) {
+			return LoginOutput{}, fmt.Errorf("prepare cached Store AMD proof: %w", proofErr)
+		}
 	}
 	report("正在准备设备认证组件；首次更新可能需要几分钟")
-	headers, state, err := storeauth.AnisetteHeaders(ctx, t.authHTTP, t.anisetteState)
+	headers, state, err := storeauth.AnisetteHeaders(prepare, t.authHTTP, t.anisetteState)
+	cancelPrepare()
 	if err != nil {
 		return LoginOutput{}, fmt.Errorf("prepare Apple authentication: %w", err)
 	}
@@ -92,11 +115,13 @@ func (t *appstore) nativeLogin(input LoginInput) (LoginOutput, error) {
 	}
 
 	report("正在完成 Apple Store 设备配置")
-	kbsync, err := t.generateKBSync(ctx, hardwareID, ^uint64(1))
+	provision, cancelProvision := context.WithTimeout(ctx, loginRuntimeTimeout)
+	defer cancelProvision()
+	kbsync, err := t.generateKBSync(provision, hardwareID, ^uint64(1))
 	if err != nil {
 		return LoginOutput{}, fmt.Errorf("generate Apple Store provisioning kbsync: %w", err)
 	}
-	state, err = storeauth.ProvisionStoreAnisette(ctx, t.authHTTP, state, action.data, privateAppStoreProvisioningURL, storeAuthenticationUserAgent, kbsync, hardwareID, headers)
+	state, err = storeauth.ProvisionStoreAnisette(provision, t.authHTTP, state, action.data, privateAppStoreProvisioningURL, storeAuthenticationUserAgent, kbsync, hardwareID, headers)
 	if err != nil {
 		return LoginOutput{}, fmt.Errorf("complete Apple Store provisioning: %w", err)
 	}
@@ -104,7 +129,7 @@ func (t *appstore) nativeLogin(input LoginInput) (LoginOutput, error) {
 		return LoginOutput{}, fmt.Errorf("save Apple authentication state: %w", err)
 	}
 	t.anisetteState = state
-	proof, nextState, proofErr := storeauth.StoreAMDHeaders(ctx, state, bag.AuthEndpoint, hardwareID)
+	proof, nextState, proofErr := storeauth.StoreAMDHeaders(provision, state, bag.AuthEndpoint, hardwareID)
 	if proofErr != nil {
 		return LoginOutput{}, fmt.Errorf("prepare Store AMD proof: %w", proofErr)
 	}

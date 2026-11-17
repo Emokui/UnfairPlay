@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	apphttp "github.com/majd/ipatool/v2/pkg/http"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
@@ -32,6 +33,11 @@ var _ = Describe("Store connection reuse", func() {
 			case "/redirect":
 				w.Header().Set("Location", "/target")
 				w.WriteHeader(http.StatusFound)
+			case "/slow-body":
+				w.WriteHeader(http.StatusOK)
+				w.(http.Flusher).Flush()
+				<-r.Context().Done()
+				return
 			case "/slow":
 				<-r.Context().Done()
 
@@ -96,6 +102,13 @@ var _ = Describe("Store connection reuse", func() {
 		_, err = backend.requestTransport(emulator.Request{Timeout: 20 * time.Millisecond})(req)
 		Expect(err).To(MatchError(ContainSubstring("deadline exceeded")))
 		Expect(get("request", "/").StatusCode).To(Equal(http.StatusOK))
+	})
+	It("times out a bag body after headers have arrived", func() {
+		client := apphttp.NewClient[[]byte](apphttp.Args{Timeout: 20 * time.Millisecond, Executor: backend.Client("bag-direct")})
+		started := time.Now()
+		_, err := client.Send(apphttp.Request{Method: http.MethodGet, URL: server.URL + "/slow-body", ResponseFormat: apphttp.ResponseFormatRaw})
+		Expect(err).To(MatchError(ContainSubstring("deadline exceeded")))
+		Expect(time.Since(started)).To(BeNumerically("<", time.Second))
 	})
 	It("cancels an active stream without closing an unrelated pooled connection", func() {
 		api := get("request", "/")

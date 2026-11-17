@@ -1,6 +1,7 @@
 package appstore
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -47,7 +48,7 @@ var _ = Describe("AppStore (Login)", func() {
 			bagClient:      mockBagClient,
 			machine:        mockMachine,
 			authRetrySleep: func(time.Duration) {},
-			actionSignerFactory: func(config SAPConfig, machineID []byte) (ActionSigner, error) {
+			actionSignerFactory: func(_ context.Context, config SAPConfig, machineID []byte) (ActionSigner, error) {
 				Expect(config).To(Equal(validSAPConfig()))
 				Expect(machineID).To(Equal([]byte{0, 0, 0, 0, 0, 0}))
 
@@ -63,7 +64,7 @@ var _ = Describe("AppStore (Login)", func() {
 	It("reuses a prepared bag and machine identity during account verification", func() {
 		mockClient.EXPECT().Send(gomock.Any()).Return(http.Result[loginResult]{StatusCode: 200, Data: loginResult{CustomerMessage: CustomerMessageBadLogin}}, nil)
 		_, err := as.loginWithConfig(LoginInput{Email: testEmail, Password: testPassword}, "", "guid", make([]byte, 6), BagOutput{SAPConfig: validSAPConfig()})
-		Expect(err).To(Equal(ErrAuthCodeRequired))
+		Expect(err).To(Equal(ErrAuthenticationAmbiguous))
 		// No machine or bag-client expectation is installed: either repeated read
 		// fails this test, while the supplied signer config is checked above.
 	})
@@ -233,7 +234,7 @@ var _ = Describe("AppStore (Login)", func() {
 
 		When("the SAP signer fails to initialize", func() {
 			BeforeEach(func() {
-				as.actionSignerFactory = func(SAPConfig, []byte) (ActionSigner, error) {
+				as.actionSignerFactory = func(context.Context, SAPConfig, []byte) (ActionSigner, error) {
 					return nil, errors.New("signer error")
 				}
 			})
@@ -263,7 +264,7 @@ var _ = Describe("AppStore (Login)", func() {
 				_, err := as.Login(LoginInput{
 					Password: testPassword,
 				})
-				Expect(err).To(HaveOccurred())
+				Expect(err).To(Equal(ErrInvalidCredentials))
 			})
 		})
 
@@ -306,7 +307,7 @@ var _ = Describe("AppStore (Login)", func() {
 			})
 		})
 
-		When("store API requires 2FA code", func() {
+		When("store API returns the ambiguous login message", func() {
 			BeforeEach(func() {
 				mockClient.EXPECT().
 					Send(gomock.Any()).
@@ -319,17 +320,17 @@ var _ = Describe("AppStore (Login)", func() {
 					}, nil)
 			})
 
-			It("returns ErrAuthCodeRequired error", func() {
+			It("does not classify the ambiguous response as a verification requirement", func() {
 				_, err := as.Login(LoginInput{
 					Password: testPassword,
 				})
-				Expect(err).To(Equal(ErrAuthCodeRequired))
+				Expect(err).To(Equal(ErrAuthenticationAmbiguous))
 			})
 
 			It("reports an incomplete verification when a code was already supplied", func() {
 				_, err := as.Login(LoginInput{Password: testPassword, AuthCode: "123456"})
 
-				Expect(err).To(MatchError("apple did not complete verification; try a fresh 2FA code"))
+				Expect(err).To(Equal(ErrVerificationRejected))
 				Expect(errors.Is(err, ErrAuthCodeRequired)).To(BeFalse())
 			})
 		})

@@ -79,7 +79,7 @@ var _ = Describe("Authentication redirects", func() {
 			return apphttp.Result[loginResult]{StatusCode: 200, Data: loginResult{FailureType: FailureTypeInvalidCredentials, CustomerMessage: "invalid credentials"}}, nil
 		}).Times(3)
 		_, err := sut.login("email", "password", "", "guid", testAuthEndpoint, &stubActionSigner{})
-		Expect(err).To(MatchError("invalid credentials"))
+		Expect(err).To(Equal(ErrInvalidCredentials))
 	})
 
 	DescribeTable("rejects unsafe or unsupported redirects before reposting credentials",

@@ -215,7 +215,7 @@ var _ = Describe("Download command", func() {
 
 		Expect(cmd.Execute()).To(Succeed())
 		Expect(store.accountInfoCalls).To(Equal(1))
-		Expect(store.loginInputs).To(Equal([]appstore.LoginInput{{Email: account.Email, Password: account.Password}}))
+		Expect(store.loginInputs).To(Equal([]appstore.LoginInput{{Context: cmd.Context(), Email: account.Email, Password: account.Password}}))
 		Expect(store.lookupInputs).To(HaveLen(len(downloadErrors)))
 		Expect(store.lookupInputs[0].Account).To(Equal(account))
 		Expect(store.downloadInputs).To(HaveLen(len(downloadErrors)))
@@ -232,6 +232,7 @@ var _ = Describe("Download command", func() {
 		Expect(store.purchaseInputs).To(HaveLen(purchaseCount))
 
 		for _, input := range store.purchaseInputs {
+			Expect(input.Context).To(Equal(cmd.Context()))
 			Expect(input.Account).To(Equal(refreshedAccount))
 		}
 	},

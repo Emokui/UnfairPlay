@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 )
 
 func (t *appstore) downloadArtwork(ctx context.Context, url string) ([]byte, error) {
@@ -17,6 +18,8 @@ func (t *appstore) downloadArtwork(ctx context.Context, url string) ([]byte, err
 		ctx = context.Background()
 	}
 
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	req, err := t.httpClient.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)

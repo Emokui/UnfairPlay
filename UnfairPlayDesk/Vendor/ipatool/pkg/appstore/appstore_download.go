@@ -6,12 +6,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	gohttp "net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
+	"github.com/majd/ipatool/v2/internal/sap/assets"
+	apphttp "github.com/majd/ipatool/v2/pkg/http"
 	"github.com/schollz/progressbar/v3"
 	"howett.net/plist"
 )
@@ -21,14 +26,16 @@ var (
 )
 
 type DownloadInput struct {
-	OnStage           func(string)
-	Context           context.Context
-	Account           Account
-	App               App
-	OutputPath        string
-	Progress          *progressbar.ProgressBar
-	ExternalVersionID string
-	Platform          Platform
+	CheckLicenseOnly   bool
+	OmitUpdateMetadata bool
+	OnStage            func(string)
+	Context            context.Context
+	Account            Account
+	App                App
+	OutputPath         string
+	Progress           *progressbar.ProgressBar
+	ExternalVersionID  string
+	Platform           Platform
 }
 
 type DownloadOutput struct {
@@ -37,11 +44,26 @@ type DownloadOutput struct {
 	Sinfs           []Sinf
 }
 
+type downloadStageKey struct{}
+
+func reportDownloadStage(ctx context.Context, message string) {
+	if ctx == nil {
+		return
+	}
+	if stage, ok := ctx.Value(downloadStageKey{}).(func(string)); ok {
+		stage(message)
+	}
+}
+
 func (t *appstore) Download(input DownloadInput) (DownloadOutput, error) {
 	stage := input.OnStage
 	if stage == nil {
 		stage = func(string) {}
 	}
+	if input.Context == nil {
+		input.Context = context.Background()
+	}
+	input.Context = assets.WithProgress(context.WithValue(input.Context, downloadStageKey{}, stage), stage)
 	stage("\u6b63\u5728\u83b7\u53d6\u4e0b\u8f7d\u5730\u5740\u4e0e\u5e94\u7528\u8bb8\u53ef")
 	macAddr, err := t.machine.MacAddress()
 	if err != nil {
@@ -70,7 +92,15 @@ func (t *appstore) Download(input DownloadInput) (DownloadOutput, error) {
 		}
 	}
 
-	res, resolvedPlatform, err := t.sendDownloadProduct(input.Context, input.Account, input.App, guid, externalVersionID, input.Platform)
+	if t.authBackend != nil {
+		stage("正在准备 Apple 下载组件")
+		if _, err := assets.Load(input.Context); err != nil {
+			return DownloadOutput{}, fmt.Errorf("prepare download components: %w", err)
+		}
+	}
+	ticketContext, cancelTicket := context.WithTimeout(input.Context, 2*time.Minute)
+	res, resolvedPlatform, err := t.sendDownloadProduct(ticketContext, input.Account, input.App, guid, externalVersionID, input.Platform)
+	cancelTicket()
 	if err != nil {
 		return DownloadOutput{}, err
 	}
@@ -96,6 +126,10 @@ func (t *appstore) Download(input DownloadInput) (DownloadOutput, error) {
 
 	if len(res.Data.Items) == 0 {
 		return DownloadOutput{}, NewErrorWithMetadata(errors.New("invalid response"), res)
+	}
+
+	if input.CheckLicenseOnly {
+		return DownloadOutput{}, nil
 	}
 
 	item := res.Data.Items[0]
@@ -144,7 +178,7 @@ func (t *appstore) Download(input DownloadInput) (DownloadOutput, error) {
 	}
 
 	stage("正在整理 IPA 与应用许可")
-	if err := t.applyPatches(item, input.Account, tmpPath, destination, artwork); err != nil {
+	if err := t.applyPatches(item, input.Account, tmpPath, destination, artwork, input.OmitUpdateMetadata); err != nil {
 		return DownloadOutput{}, fmt.Errorf("failed to apply patches: %w", err)
 	}
 
@@ -252,7 +286,38 @@ type downloadResult struct {
 }
 
 //nolint:nonamedreturns // Deferred close errors must propagate to callers.
-func (t *appstore) downloadFile(ctx context.Context, src, dst string, progress *progressbar.ProgressBar) (err error) {
+func (t *appstore) downloadFile(ctx context.Context, src, dst string, progress *progressbar.ProgressBar) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for attempt := 0; ; attempt++ {
+		err := t.downloadFileAttempt(ctx, src, dst, progress)
+		if err == nil || attempt == 1 || ctx.Err() != nil {
+			return err
+		}
+		var interrupted *downloadTransferError
+		if !errors.As(err, &interrupted) && !errors.Is(err, io.ErrUnexpectedEOF) {
+			return err
+		}
+		reportDownloadStage(ctx, "下载连接中断，正在续传")
+	}
+}
+
+type downloadTransferError struct{ error }
+
+func (e *downloadTransferError) Unwrap() error { return e.error }
+
+type downloadBodyReader struct{ io.Reader }
+
+func (r downloadBodyReader) Read(buffer []byte) (int, error) {
+	n, err := r.Reader.Read(buffer)
+	if err != nil && err != io.EOF && !errors.Is(err, context.Canceled) {
+		err = &downloadTransferError{err}
+	}
+	return n, err
+}
+
+func (t *appstore) downloadFileAttempt(ctx context.Context, src, dst string, progress *progressbar.ProgressBar) (err error) {
 	req, err := t.httpClient.NewRequest("GET", src, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
@@ -288,6 +353,12 @@ func (t *appstore) downloadFile(ctx context.Context, src, dst string, progress *
 
 	res, err := t.httpClient.Do(req)
 	if err != nil {
+		var network net.Error
+		if errors.Is(err, apphttp.ErrTransferIdleTimeout) || errors.Is(err, io.EOF) ||
+			errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) ||
+			(errors.As(err, &network) && network.Timeout()) {
+			err = &downloadTransferError{err}
+		}
 		return fmt.Errorf("request failed: %w", err)
 	}
 	defer res.Body.Close()
@@ -323,7 +394,7 @@ func (t *appstore) downloadFile(ctx context.Context, src, dst string, progress *
 		writer = io.MultiWriter(file, progress)
 	}
 
-	var body io.Reader = res.Body
+	var body io.Reader = downloadBodyReader{res.Body}
 	if remaining >= 0 {
 		body = io.LimitReader(body, remaining)
 	}
@@ -405,7 +476,7 @@ func (t *appstore) isDirectory(path string) (bool, error) {
 }
 
 //nolint:nonamedreturns // Deferred close errors must propagate to callers.
-func (t *appstore) applyPatches(item downloadItemResult, acc Account, src, dst string, artwork []byte) (err error) {
+func (t *appstore) applyPatches(item downloadItemResult, acc Account, src, dst string, artwork []byte, omitUpdateMetadata bool) (err error) {
 	srcZip, err := zip.OpenReader(src)
 	if err != nil {
 		return fmt.Errorf("failed to open zip reader: %w", err)
@@ -430,7 +501,15 @@ func (t *appstore) applyPatches(item downloadItemResult, acc Account, src, dst s
 		}
 	}()
 
-	err = t.replicateZip(srcZip, dstZip, src)
+	replacing, err := t.sinfReplacementPaths(srcZip, item.Sinfs)
+	if err != nil {
+		return err
+	}
+	replacing["iTunesMetadata.plist"] = true
+	if len(artwork) > 0 {
+		replacing["iTunesArtwork"] = true
+	}
+	err = t.replicateZip(srcZip, dstZip, src, replacing)
 	if err != nil {
 		return fmt.Errorf("failed to replicate zip: %w", err)
 	}
@@ -450,9 +529,10 @@ func (t *appstore) applyPatches(item downloadItemResult, acc Account, src, dst s
 		return err
 	}
 
-	err = t.writeMetadata(item.Metadata, acc, dstZip)
-	if err != nil {
-		return fmt.Errorf("failed to write metadata: %w", err)
+	if !omitUpdateMetadata {
+		if err := t.writeMetadata(item.Metadata, acc, dstZip); err != nil {
+			return fmt.Errorf("failed to write metadata: %w", err)
+		}
 	}
 
 	return nil

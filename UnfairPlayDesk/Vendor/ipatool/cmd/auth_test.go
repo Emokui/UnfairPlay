@@ -1,9 +1,12 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/majd/ipatool/v2/pkg/appstore"
 	"github.com/majd/ipatool/v2/pkg/log"
@@ -41,7 +44,7 @@ var _ = Describe("Login command", func() {
 
 		Expect(cmd.Execute()).To(Succeed())
 		Expect(store.loginCalls).To(Equal(1))
-		Expect(store.input).To(Equal(appstore.LoginInput{Email: appleID, Password: "secret"}))
+		Expect(store.input).To(Equal(appstore.LoginInput{Context: cmd.Context(), Email: appleID, Password: "secret"}))
 	},
 		Entry("interactive email", true, "user@example.com"),
 		Entry("non-interactive email", false, "user@example.com"),
@@ -50,6 +53,71 @@ var _ = Describe("Login command", func() {
 		Entry("interactive Indian phone number", true, "9123456789"),
 		Entry("non-interactive Indian phone number", false, "9123456789"),
 	)
+
+	DescribeTable("only retries an uncertain sign-in after a code is provided", func(firstError error, input, code string, interactive bool) {
+		store.firstError = firstError
+		dir := GinkgoT().TempDir()
+		inputPath := filepath.Join(dir, "stdin")
+		Expect(os.WriteFile(inputPath, []byte(input), 0600)).To(Succeed())
+		stdin, err := os.Open(inputPath)
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(stdin.Close)
+		stderr, err := os.Create(filepath.Join(dir, "stderr"))
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(stderr.Close)
+		previousStdin, previousStderr := os.Stdin, os.Stderr
+		os.Stdin, os.Stderr = stdin, stderr
+		DeferCleanup(func() { os.Stdin, os.Stderr = previousStdin, previousStderr })
+
+		cmd := loginCmd()
+		cmd.SetContext(context.WithValue(context.Background(), interactiveKey, interactive))
+		cmd.SetArgs([]string{"--email", "user@example.com", "--password", "synthetic"})
+		cmd.SilenceErrors = true
+		cmd.SilenceUsage = true
+		err = cmd.Execute()
+		if code == "" {
+			Expect(err).To(MatchError(firstError))
+			Expect(store.loginCalls).To(Equal(1))
+		} else {
+			Expect(err).NotTo(HaveOccurred())
+			Expect(store.loginCalls).To(Equal(2))
+			Expect(store.input.AuthCode).To(Equal(code))
+		}
+		prompt, err := os.ReadFile(stderr.Name())
+		Expect(err).NotTo(HaveOccurred())
+		if interactive && firstError == appstore.ErrAuthenticationAmbiguous {
+			Expect(string(prompt)).To(ContainSubstring("If you received a code"))
+		} else {
+			Expect(prompt).To(BeEmpty())
+		}
+	},
+		Entry("rejects a known bad password immediately", appstore.ErrInvalidCredentials, "", "", true),
+		Entry("leaves an uncertain noninteractive sign-in as an error", appstore.ErrAuthenticationAmbiguous, "", "", false),
+		Entry("declines an uncertain sign-in with a blank response", appstore.ErrAuthenticationAmbiguous, "\n", "", true),
+		Entry("retries with a code the user already received", appstore.ErrAuthenticationAmbiguous, "123456\n", "123456", true),
+	)
+
+	DescribeTable("reports the storefront without exposing credentials", func(info bool) {
+		store.account = appstore.Account{Name: "Test", Email: "test@example.com", StoreFront: "143462-1,32", Password: "stored-secret", PasswordToken: "stored-token"}
+		var output bytes.Buffer
+		dependencies.Logger = log.NewLogger(log.Args{Writer: &output})
+		cmd := loginCmd()
+		args := []string{"--email", "test@example.com", "--password", "synthetic-password"}
+		if info {
+			cmd = infoCmd()
+			args = nil
+		}
+		cmd.SetContext(context.WithValue(context.Background(), interactiveKey, false))
+		cmd.SetArgs(args)
+		Expect(cmd.Execute()).To(Succeed())
+		lines := strings.Split(strings.TrimSpace(output.String()), "\n")
+		var result map[string]interface{}
+		Expect(json.Unmarshal([]byte(lines[len(lines)-1]), &result)).To(Succeed())
+		Expect(result["storeFront"]).To(Equal("143462-1,32"))
+		Expect(result["email"]).To(Equal("test@example.com"))
+		Expect(output.String()).NotTo(ContainSubstring("stored-secret"))
+		Expect(output.String()).NotTo(ContainSubstring("stored-token"))
+	}, Entry("login", false), Entry("account info", true))
 
 	DescribeTable("prompts for an Apple ID", func(input, appleID, message string) {
 		dir := GinkgoT().TempDir()
@@ -76,7 +144,7 @@ var _ = Describe("Login command", func() {
 		if message == "" {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(store.loginCalls).To(Equal(1))
-			Expect(store.input).To(Equal(appstore.LoginInput{Email: appleID, Password: "secret"}))
+			Expect(store.input).To(Equal(appstore.LoginInput{Context: cmd.Context(), Email: appleID, Password: "secret"}))
 		} else {
 			Expect(err).To(MatchError(message))
 			Expect(store.loginCalls).To(BeZero())
@@ -93,14 +161,23 @@ var _ = Describe("Login command", func() {
 })
 
 type fakeLoginAppStore struct {
+	account appstore.Account
 	appstore.AppStore
 	input      appstore.LoginInput
 	loginCalls int
+	firstError error
 }
 
 func (f *fakeLoginAppStore) Login(input appstore.LoginInput) (appstore.LoginOutput, error) {
 	f.input = input
 	f.loginCalls++
+	if f.loginCalls == 1 && f.firstError != nil {
+		return appstore.LoginOutput{}, f.firstError
+	}
 
-	return appstore.LoginOutput{}, nil
+	return appstore.LoginOutput{Account: f.account}, nil
+}
+
+func (f *fakeLoginAppStore) AccountInfo() (appstore.AccountInfoOutput, error) {
+	return appstore.AccountInfoOutput{Account: f.account}, nil
 }

@@ -33,7 +33,7 @@ func rootCmd() *cobra.Command {
 			if err := validateSessionProfile(sessionProfile); err != nil {
 				return err
 			}
-			ctx := context.WithValue(context.Background(), interactiveKey, !nonInteractive)
+			ctx := context.WithValue(cmd.Context(), interactiveKey, !nonInteractive)
 			cmd.SetContext(ctx)
 			initWithCommand(cmd)
 			return nil

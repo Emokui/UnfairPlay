@@ -71,9 +71,12 @@ func (e *executor) Send(request apphttp.Request, body []byte) (*http.Response, e
 			direct.Header.Set("User-Agent", apphttp.DefaultUserAgent)
 		}
 
-		return e.backend.requestTransport(emulator.Request{Operation: "authenticate"})(direct)
+		return e.backend.requestTransport(emulator.Request{Operation: "authenticate", Timeout: request.Timeout})(direct)
 	}
 
+	// Bound framework preparation too; the network keeps its own I/O limit.
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
 	input := emulator.Request{URL: request.URL, Method: request.Method, Operation: e.operation, Format: string(request.ResponseFormat), Timeout: request.Timeout, Body: body, Headers: make(http.Header), NoRedirects: request.NoRedirects, Raw: request.ResponseFormat == apphttp.ResponseFormatRaw}
 	for key, value := range request.Headers {
 		input.Headers.Set(key, value)
@@ -98,8 +101,11 @@ func (e *executor) Do(request *http.Request) (*http.Response, error) {
 		return nil, errors.New("store request is nil")
 	}
 
+	if e.operation == "transfer" {
+		return e.backend.transfer(request)
+	}
 	if e.operation == "sap" {
-		return e.backend.requestTransport(emulator.Request{Operation: "authenticate"})(request)
+		return e.backend.requestTransport(emulator.Request{Operation: "authenticate", Timeout: apphttp.DefaultAuthenticationTimeout})(request)
 	}
 
 	var body []byte

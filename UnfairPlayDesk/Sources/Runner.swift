@@ -2,14 +2,38 @@ import Foundation
 import Combine
 import Darwin
 
+enum InputPrompt: Hashable {
+    case account, password, verification, verificationChoice, passphrase
+
+    static func match(_ line: String) -> Self? {
+        let text = line.trimmingCharacters(in: .whitespaces).lowercased()
+        if text.hasSuffix("enter apple id (email address or phone number):") { return .account }
+        if text.hasSuffix("password:") { return .password }
+        if text.hasSuffix("enter 2fa code:") { return .verification }
+        if text.hasSuffix("if you received a code, enter it or leave blank:") { return .verificationChoice }
+        if text.contains("enter passphrase to unlock") && text.hasSuffix(":") { return .passphrase }
+        return nil
+    }
+
+    var title: String {
+        switch self {
+        case .account: "Apple ID"
+        case .password: "Apple 账户密码"
+        case .verification: "双重认证验证码"
+        case .verificationChoice: "登录未确认"
+        case .passphrase: "凭据库解锁口令"
+        }
+    }
+}
+
 final class Runner: ObservableObject {
     static var active: [UUID: Runner] = [:]
     let id = UUID()
     @Published var busy = false
     @Published var log = "操作结果会显示在这里。"
     @Published var title = "就绪"
-    @Published var sensitive = true
-    @Published var canReply = false
+    @Published private(set) var inputPrompt: InputPrompt?
+    var canReply: Bool { inputPrompt != nil }
     @Published var hint: String?
     @Published var progress: Double?
     @Published var currentLine = ""
@@ -21,22 +45,15 @@ final class Runner: ObservableObject {
     var cancelled = false
     var privileged = false
     var saving = false
+    private var holdsCompletion = false
     var background = false
     var pendingBytes = Data()
     private var pendingCR = false
+    private var submittedPromptLine: String?
     private var generation = UUID()
     private var progressBuffer = ""
     private let verify: () async throws -> Void
     init(verify: @escaping () async throws -> Void = { try await Core.bundleVerification.value }) { self.verify = verify }
-    var displayOutput: String {
-        (log + currentLine)
-            .replacingOccurrences(of: "preparing authentication; the first login may take a few minutes", with: "正在准备认证；首次需要下载组件，完成后自动复用缓存")
-            .replacingOccurrences(of: "enter password:", with: "请输入 Apple 账户密码：")
-            .replacingOccurrences(of: "enter 2FA code:", with: "请输入双重认证验证码：")
-            .replacingOccurrences(of: "enter Apple ID (email address or phone number):", with: "请输入 Apple ID（邮箱或手机号）：")
-            .replacingOccurrences(of: "enter passphrase to unlock", with: "请输入凭据库解锁口令：")
-            .replacingOccurrences(of: "(this is separate from your Apple ID password)", with: "（与 Apple ID 密码不同）")
-    }
     var worker: URL {
         #if DESK_TESTING
         return URL(fileURLWithPath: ProcessInfo.processInfo.environment["DESK_WORKER"]!)
@@ -44,18 +61,19 @@ final class Runner: ObservableObject {
         return Bundle.main.resourceURL!.appendingPathComponent("Tools/worker")
         #endif
     }
-    func launch(_ url: URL, _ args: [String], title: String, privileged: Bool = false, done: ((Bool)->Void)? = nil) {
+    func launch(_ url: URL, _ args: [String], title: String, privileged: Bool = false, holdsCompletion: Bool = false, done: ((Bool)->Void)? = nil) {
         guard !busy else { return }
         generation = UUID()
         let token = generation
-        self.title = title; hint = nil; log = ""; output = ""; currentLine = ""; progress = nil; progressBuffer = ""; pendingBytes = Data(); pendingCR = false; sensitive = true
-        finished = done; self.privileged = privileged; cancelled = false
-        busy = true; canReply = false; Runner.active[id] = self
+        self.title = title; hint = nil; log = ""; output = ""; currentLine = ""; progress = nil; progressBuffer = ""; pendingBytes = Data(); pendingCR = false; submittedPromptLine = nil
+        finished = done; self.privileged = privileged; self.holdsCompletion = holdsCompletion && done != nil; cancelled = false
+        busy = true; inputPrompt = nil; Runner.active[id] = self
         Task { @MainActor in
             do { try await verify() }
             catch { failLaunch(error.localizedDescription); return }
             if cancelled {
-                busy = false; Runner.active.removeValue(forKey: id); self.title = "操作已取消"
+                updateCompletionState()
+                self.title = "操作已取消"
                 let callback = finished; finished = nil; callback?(false); return
             }
             startProcess(url, args, token: token)
@@ -99,10 +117,10 @@ final class Runner: ObservableObject {
                     self.receive(Data(bytes.prefix(count)))
                 }
                 if !self.pendingBytes.isEmpty { self.append(String(decoding: self.pendingBytes, as: UTF8.self)); self.pendingBytes = Data() }
-                self.busy = false; self.canReply = false; self.master = -1
-                self.outputHandle = nil; self.process = nil
-                Runner.active.removeValue(forKey: self.id)
                 let ok = process.terminationStatus == 0 && !self.cancelled
+                self.updateCompletionState()
+                self.inputPrompt = nil; self.master = -1
+                self.outputHandle = nil; self.process = nil
                 self.title = self.cancelled ? "操作已取消" : ok ? "操作完成" : "操作失败"
                 self.hint = ok || self.cancelled ? nil : Core.errorHint(self.output)
                 if ok { self.progress = 1 }
@@ -112,16 +130,21 @@ final class Runner: ObservableObject {
         }
         do {
             try task.run(); try? slave.close()
-            process = task; busy = true; canReply = !privileged; Runner.active[id] = self
+            process = task; busy = true; inputPrompt = nil; Runner.active[id] = self
         } catch {
             reader.readabilityHandler = nil; try? slave.close(); try? reader.close()
             outputHandle = nil; master = -1; failLaunch(error.localizedDescription)
         }
     }
     func failLaunch(_ reason: String) {
-        log = reason; title = "启动失败"; hint = reason; busy = false; canReply = false
-        Runner.active.removeValue(forKey: id)
+        log = reason; title = "启动失败"; hint = reason; inputPrompt = nil
+        updateCompletionState()
         let callback = finished; finished = nil; callback?(false)
+    }
+    private func updateCompletionState() {
+        saving = holdsCompletion
+        busy = holdsCompletion
+        if !holdsCompletion { Runner.active.removeValue(forKey: id) }
     }
     func receive(_ data: Data) {
         pendingBytes.append(data)
@@ -141,10 +164,11 @@ final class Runner: ObservableObject {
         while let end = progressBuffer.firstIndex(of: "\n") {
             let line = String(progressBuffer[..<end])
             progressBuffer.removeSubrange(...end)
-            if let data = line.trimmingCharacters(in: .whitespacesAndNewlines).data(using: .utf8),
+            if let start = line.firstIndex(of: "{"),
+               let data = String(line[start...]).trimmingCharacters(in: .whitespacesAndNewlines).data(using: .utf8),
                let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
                let message = json["message"] as? String,
-               message.hasPrefix("正在") || message.hasPrefix("首次准备：") || message.hasPrefix("已提取认证组件") || message == "已复用认证组件缓存" || message == "认证组件准备完成，正在验证 Apple 账户" {
+               json["phase"] != nil || message.hasPrefix("正在") || message.hasPrefix("首次准备：") || message.hasPrefix("已提取认证组件") || message == "已复用认证组件缓存" || message == "认证组件准备完成，正在验证 Apple 账户" {
                 title = message
                 if let phase = json["phase"] as? String {
                     structuredProgress = true
@@ -156,7 +180,9 @@ final class Runner: ObservableObject {
                 }
             }
         }
-        if progressBuffer.utf8.count > 8192 { progressBuffer = "" }
+        // Drop stale terminal percentages, while retaining a split JSON record.
+        if let start = progressBuffer.firstIndex(of: "{") { progressBuffer = String(progressBuffer[start...]) }
+        else if progressBuffer.utf8.count > 8192 { progressBuffer = String(progressBuffer.suffix(4096)) }
         output += clean
         if output.count > 200000 { output = String(output.suffix(150000)) }
         var history = log, line = currentLine
@@ -170,27 +196,39 @@ final class Runner: ObservableObject {
         }
         log = history.count > 40000 ? String(history.suffix(30000)) : history
         currentLine = line.count > 8000 ? String(line.suffix(8000)) : line
-        if currentLine.contains("enter password:") { title = "等待输入 Apple 账户密码" }
-        else if currentLine.contains("enter 2FA code:") { title = "等待输入双重认证验证码" }
-        else if currentLine.contains("enter passphrase to unlock") { title = "等待输入凭据库口令" }
+        let prompt = InputPrompt.match(currentLine)
+        if currentLine != submittedPromptLine || clean.contains("\n") || clean.contains("\r") { submittedPromptLine = nil }
+        let next = busy && !privileged && !cancelled && master >= 0 && submittedPromptLine == nil ? prompt : nil
+        if inputPrompt != next { inputPrompt = next }
+        if let prompt, submittedPromptLine == nil {
+            title = prompt == .verificationChoice ? "等待确认登录" : "等待输入" + prompt.title
+        }
         if !structuredProgress, let range = clean.range(of: #"([0-9]{1,3})%"#, options: [.regularExpression, .backwards]), let number = Double(clean[range].dropLast()) { progress = min(number / 100, 1) }
     }
     func reply(_ value: String) {
-        guard busy, master >= 0 else { return }
+        guard canReply, master >= 0 else { return }
         let data = Data((value + "\n").utf8)
-        data.withUnsafeBytes { _ = write(master, $0.baseAddress, $0.count) }
+        let written = data.withUnsafeBytes { write(master, $0.baseAddress, $0.count) }
+        guard written == data.count else { stop(); return }
+        submittedPromptLine = currentLine
+        inputPrompt = nil
+        title = "正在处理…"
     }
     @MainActor func fileWork<T>(_ title: String, operation: @escaping () throws -> T) async -> Result<T, Error> {
-        busy = true; saving = true; canReply = false; self.title = title; progress = nil; hint = nil
+        busy = true; saving = true; inputPrompt = nil; self.title = title; progress = nil; hint = nil
         Runner.active[id] = self
         let result = await Task.detached(priority: .userInitiated) { Result { try operation() } }.value
-        saving = false; busy = false
-        Runner.active.removeValue(forKey: id)
+        updateCompletionState()
         switch result {
         case .success: self.title = "操作完成"
         case .failure: self.title = "操作失败"
         }
         return result
+    }
+    @MainActor func finishCompletion() {
+        guard holdsCompletion else { return }
+        holdsCompletion = false; saving = false; busy = false
+        Runner.active.removeValue(forKey: id)
     }
     @MainActor func saveFile(_ operation: @escaping () throws -> Void) async -> Result<Void, Error> {
         let started = Date()
@@ -204,6 +242,6 @@ final class Runner: ObservableObject {
     }
     func stop() {
         guard !privileged && !saving else { return }
-        cancelled = true; process?.terminate()
+        cancelled = true; inputPrompt = nil; process?.terminate()
     }
 }

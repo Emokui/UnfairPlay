@@ -20,7 +20,10 @@ import (
 )
 
 var (
-	ErrAuthCodeRequired = errors.New("auth code is required")
+	ErrAuthCodeRequired        = errors.New("auth code is required")
+	ErrAuthenticationAmbiguous = errors.New("apple did not confirm sign-in; check your password or use a verification code if you received one")
+	ErrInvalidCredentials      = errors.New("incorrect Apple account or password")
+	ErrVerificationRejected    = errors.New("apple did not accept the password and verification code")
 )
 
 type authenticationMachineActionError struct {
@@ -40,6 +43,7 @@ const (
 )
 
 type LoginInput struct {
+	Context  context.Context
 	Email    string
 	Password string
 	AuthCode string
@@ -53,6 +57,13 @@ type LoginOutput struct {
 }
 
 func (t *appstore) Login(input LoginInput) (LoginOutput, error) {
+	if input.Context == nil {
+		input.Context = context.Background()
+	}
+	if err := input.Context.Err(); err != nil {
+		return LoginOutput{}, err
+	}
+
 	if t.authBackend != nil {
 		return t.nativeLogin(input)
 	}
@@ -76,7 +87,7 @@ func (t *appstore) legacyLogin(input LoginInput) (LoginOutput, error) {
 		return LoginOutput{}, err
 	}
 
-	bag, err := t.bag(guid)
+	bag, err := t.bagContext(input.Context, guid)
 	if err != nil {
 		return LoginOutput{}, fmt.Errorf("failed to get bag: %w", err)
 	}
@@ -87,11 +98,21 @@ func (t *appstore) legacyLogin(input LoginInput) (LoginOutput, error) {
 // One login operation reuses the same authenticated bag and machine identity
 // through device-provisioning requests, instead of fetching them again.
 func (t *appstore) loginWithConfig(input LoginInput, authCode, guid string, machineID []byte, bag BagOutput) (LoginOutput, error) {
+	ctx := input.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, loginAuthenticationTimeout)
+	defer cancel()
+	return t.loginWithContext(ctx, input, authCode, guid, machineID, bag)
+}
+
+func (t *appstore) loginWithContext(ctx context.Context, input LoginInput, authCode, guid string, machineID []byte, bag BagOutput) (LoginOutput, error) {
 	if t.actionSignerFactory == nil {
 		return LoginOutput{}, errors.New("SAP action signer is not configured")
 	}
 
-	signer, err := t.actionSignerFactory(bag.SAPConfig, machineID)
+	signer, err := t.actionSignerFactory(ctx, bag.SAPConfig, machineID)
 	if err != nil {
 		return LoginOutput{}, fmt.Errorf("failed to initialize SAP action signer: %w", err)
 	}
@@ -100,7 +121,7 @@ func (t *appstore) loginWithConfig(input LoginInput, authCode, guid string, mach
 		return LoginOutput{}, errors.New("SAP action signer factory returned nil")
 	}
 
-	acc, loginErr := t.login(input.Email, input.Password, authCode, guid, bag.SAPConfig.AuthEndpoint, signer)
+	acc, loginErr := t.loginContext(ctx, input.Email, input.Password, authCode, guid, bag.SAPConfig.AuthEndpoint, signer)
 	closeErr := signer.Close()
 
 	if closeErr != nil {
@@ -159,7 +180,21 @@ type loginAccountResult struct {
 	Address loginAddressResult `plist:"address,omitempty"`
 }
 
+type loginDialogActionResult struct {
+	Kind string `plist:"kind,omitempty"`
+	URL  string `plist:"url,omitempty"`
+}
+
+type loginDialogResult struct {
+	Message            string                  `plist:"message,omitempty"`
+	Explanation        string                  `plist:"explanation,omitempty"`
+	OKButtonString     string                  `plist:"okButtonString,omitempty"`
+	OKButtonAction     loginDialogActionResult `plist:"okButtonAction,omitempty"`
+	CancelButtonString string                  `plist:"cancelButtonString,omitempty"`
+}
+
 type loginResult struct {
+	Dialog              loginDialogResult  `plist:"dialog,omitempty"`
 	FailureType         string             `plist:"failureType,omitempty"`
 	CustomerMessage     string             `plist:"customerMessage,omitempty"`
 	Account             loginAccountResult `plist:"accountInfo,omitempty"`
@@ -170,6 +205,10 @@ type loginResult struct {
 var storeCookieDSIDPattern = regexp.MustCompile(`(?:^|[ ,])mz_at(?:0|_ssl)-([0-9]+)=`)
 
 func (t *appstore) login(email, password, authCode, guid, endpoint string, signer ActionSigner) (Account, error) {
+	return t.loginContext(context.Background(), email, password, authCode, guid, endpoint, signer)
+}
+
+func (t *appstore) loginContext(ctx context.Context, email, password, authCode, guid, endpoint string, signer ActionSigner) (Account, error) {
 	request := t.loginRequest(email, password, authCode, guid, endpoint, 1, signer)
 	redirects := 0
 
@@ -179,6 +218,10 @@ func (t *appstore) login(email, password, authCode, guid, endpoint string, signe
 	)
 
 	for attempt := 1; ; {
+		if err := ctx.Err(); err != nil {
+			return Account{}, err
+		}
+		request.Context = ctx
 		res, err = t.sendAuthenticationRequest(request)
 
 		if err != nil {
@@ -277,13 +320,19 @@ func (t *appstore) sendAuthenticationRequest(request http.Request) (http.Result[
 	statuses := make([]string, 0, maxAuthenticationRequestAttempts)
 	onlyHTTP := true
 
-	sleep := t.authRetrySleep
-	if sleep == nil {
-		sleep = time.Sleep
+	ctx := request.Context
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
 	for attempt := 1; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return http.Result[loginResult]{}, err
+		}
 		result, err := t.loginClient.Send(request)
+		if ctx.Err() != nil {
+			return result, ctx.Err()
+		}
 
 		status, retry := retryableAuthenticationError(err)
 		if !retry {
@@ -343,7 +392,17 @@ func (t *appstore) sendAuthenticationRequest(request http.Request) (http.Result[
 			delay = max(requested, time.Second)
 		}
 
-		sleep(delay)
+		if t.authRetrySleep != nil {
+			t.authRetrySleep(delay)
+			continue
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return result, ctx.Err()
+		case <-timer.C:
+		}
 	}
 }
 
@@ -389,6 +448,8 @@ func (t *appstore) parseLoginResponse(res *http.Result[loginResult], attempt int
 
 	if action := authenticationMachineAction(res.Headers); action != nil {
 		err = action
+	} else if dialogErr := authenticationDialogError(res.Data); dialogErr != nil {
+		err = NewErrorWithMetadata(dialogErr, res)
 	} else if res.StatusCode >= gohttp.StatusMultipleChoices && res.StatusCode < gohttp.StatusBadRequest {
 		if redirect, err = res.GetHeader("location"); err != nil {
 			err = fmt.Errorf("failed to retrieve redirect location: %w", err)
@@ -405,13 +466,22 @@ func (t *appstore) parseLoginResponse(res *http.Result[loginResult], attempt int
 		}
 
 		retry = true
-	} else if attempt == 1 && res.Data.FailureType == FailureTypeInvalidCredentials {
-		retry = true
+	} else if res.Data.FailureType == FailureTypeInvalidCredentials {
+		switch {
+		case attempt == 1:
+			retry = true
+		case authCode != "":
+			err = ErrVerificationRejected
+		default:
+			err = ErrInvalidCredentials
+		}
 	} else if res.Data.FailureType == "" && res.Data.CustomerMessage == CustomerMessageBadLogin {
+		// Apple can return this message for a rejected password as well as a
+		// login that needs additional verification.
 		if authCode == "" {
-			err = ErrAuthCodeRequired
+			err = ErrAuthenticationAmbiguous
 		} else {
-			err = errors.New("apple did not complete verification; try a fresh 2FA code")
+			err = ErrVerificationRejected
 		}
 	} else if res.Data.FailureType == "" && res.Data.CustomerMessage == CustomerMessageAccountDisabled {
 		err = NewErrorWithMetadata(errors.New("account is disabled"), res)
@@ -426,6 +496,70 @@ func (t *appstore) parseLoginResponse(res *http.Result[loginResult], attempt int
 	}
 
 	return retry, redirect, err
+}
+
+func authenticationDialogError(result loginResult) error {
+	dialog := result.Dialog
+	if strings.TrimSpace(dialog.Message) == "" && strings.TrimSpace(dialog.Explanation) == "" &&
+		strings.TrimSpace(dialog.OKButtonString) == "" && strings.TrimSpace(dialog.CancelButtonString) == "" &&
+		strings.TrimSpace(dialog.OKButtonAction.Kind) == "" && strings.TrimSpace(dialog.OKButtonAction.URL) == "" {
+		return nil
+	}
+
+	message := strings.TrimSpace(dialog.Message)
+	explanation := strings.TrimSpace(dialog.Explanation)
+
+	if message == "" {
+		message = strings.TrimSpace(result.CustomerMessage)
+	}
+
+	actionURL := trustedAuthenticationDialogURL(dialog.OKButtonAction)
+	if message == "" && explanation == "" && actionURL == "" {
+		return nil
+	}
+
+	parts := make([]string, 0, 2)
+	if message != "" {
+		parts = append(parts, message)
+	}
+
+	if explanation != "" && explanation != message {
+		parts = append(parts, explanation)
+	}
+
+	detail := strings.Join(parts, ": ")
+	if detail == "" {
+		detail = "Apple requires action before sign-in can continue"
+	}
+
+	if actionURL != "" {
+		label := strings.TrimSpace(dialog.OKButtonString)
+		if label == "" {
+			label = "Continue"
+		}
+
+		detail += fmt.Sprintf(" (%s: %s)", label, actionURL)
+	}
+
+	return errors.New(detail)
+}
+
+func trustedAuthenticationDialogURL(action loginDialogActionResult) string {
+	if !strings.EqualFold(strings.TrimSpace(action.Kind), "OpenURL") {
+		return ""
+	}
+
+	value, err := url.Parse(strings.TrimSpace(action.URL))
+	if err != nil || value.Scheme != "https" || value.User != nil || value.Fragment != "" || value.Port() != "" && value.Port() != "443" {
+		return ""
+	}
+
+	host := strings.ToLower(value.Hostname())
+	if host != "apple.com" && !strings.HasSuffix(host, ".apple.com") {
+		return ""
+	}
+
+	return value.String()
 }
 
 func authenticationMachineAction(headers map[string]string) *authenticationMachineActionError {

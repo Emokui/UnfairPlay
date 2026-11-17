@@ -74,6 +74,7 @@ func purchaseCmdWithAppStore(appStore func() appstore.AppStore) *cobra.Command {
 				}
 
 				err = store.Purchase(appstore.PurchaseInput{
+					Context:  cmd.Context(),
 					Account:  acc,
 					App:      app,
 					Platform: platform,

@@ -83,6 +83,17 @@ var _ = Describe("AppStore (preferred kbsync download)", func() {
 		Expect(generated).To(Equal(1))
 	})
 
+	DescribeTable("returns account and license failures directly without a legacy retry", func(failure string) {
+		response := http.Result[downloadResult]{StatusCode: gohttp.StatusOK, Data: downloadResult{FailureType: failure}}
+		bags.EXPECT().Send(gomock.Any()).Return(http.Result[bagResult]{StatusCode: gohttp.StatusOK, Data: bag}, nil)
+		downloads.EXPECT().Send(gomock.Any()).Return(response, nil)
+		actual, _, err := store.sendDownloadProduct(context.Background(), account, app, guid, versionID, PlatformIPhone)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(actual.Data.FailureType).To(Equal(failure))
+		Expect(generated).To(Equal(1))
+		Expect(store.cachedKBSync(123456789012, guid)).To(BeEmpty())
+	}, Entry("license", FailureTypeLicenseNotFound), Entry("expired token", FailureTypePasswordTokenExpired))
+
 	It("enables kbsync generation for normal clients", func() {
 		Expect(NewAppStore(Args{}).(*appstore).kbsyncGenerator).NotTo(BeNil())
 	})
@@ -231,14 +242,11 @@ var _ = Describe("AppStore (preferred kbsync download)", func() {
 		Entry("watchOS", PlatformWatchOS),
 	)
 
-	It("pins the iOS offer before trying ent/download", func() {
+	It("downloads latest iOS directly without a public catalog dependency", func() {
 		gomock.InOrder(
 			bags.EXPECT().Send(gomock.Any()).Return(http.Result[bagResult]{StatusCode: gohttp.StatusOK, Data: bag}, nil),
-			platforms.EXPECT().Send(gomock.Any()).Return(http.Result[platformVersionLookupResult]{StatusCode: gohttp.StatusOK, Data: platformVersionLookupResult{
-				Results: map[string]platformVersionLookupItem{"42": {Offers: []platformVersionLookupOffer{{Version: platformVersionLookupVersion{ExternalID: platformVersionExternalID(versionID)}}}}},
-			}}, nil),
 			downloads.EXPECT().Send(gomock.Any()).Do(func(req http.Request) {
-				Expect(req.Payload.(*http.XMLPayload).Content).To(HaveKeyWithValue("externalVersionId", versionID))
+				Expect(req.Payload.(*http.XMLPayload).Content).NotTo(HaveKey("externalVersionId"))
 			}).Return(success, nil),
 		)
 		actual, platform, err := store.sendDownloadProduct(context.Background(), account, app, guid, "", "")
@@ -276,9 +284,6 @@ var _ = Describe("AppStore (preferred kbsync download)", func() {
 		success.Data.Items[0].Metadata["softwareVersionExternalIdentifiers"] = []interface{}{"123456788", versionID}
 		gomock.InOrder(
 			bags.EXPECT().Send(gomock.Any()).Return(http.Result[bagResult]{StatusCode: gohttp.StatusOK, Data: bag}, nil),
-			platforms.EXPECT().Send(gomock.Any()).Return(http.Result[platformVersionLookupResult]{StatusCode: gohttp.StatusOK, Data: platformVersionLookupResult{
-				Results: map[string]platformVersionLookupItem{"42": {Offers: []platformVersionLookupOffer{{Version: platformVersionLookupVersion{ExternalID: platformVersionExternalID(versionID)}}}}},
-			}}, nil),
 			downloads.EXPECT().Send(gomock.Any()).Do(func(req http.Request) {
 				Expect(req.URL).To(Equal(testEntDownloadEndpoint + "?guid=" + guid))
 			}).Return(success, nil),
@@ -323,7 +328,7 @@ var _ = Describe("AppStore (preferred kbsync download)", func() {
 		gomock.InOrder(
 			downloads.EXPECT().Send(gomock.Any()).Do(func(req http.Request) {
 				Expect(req.URL).To(Equal(testEntDownloadEndpoint + "?guid=" + guid))
-			}).Return(response, nil),
+			}).Return(empty, nil),
 			downloads.EXPECT().Send(gomock.Any()).Do(func(req http.Request) {
 				Expect(req.URL).To(ContainSubstring("volumeStoreDownloadProduct"))
 			}).Return(response, nil),
@@ -361,10 +366,10 @@ var _ = Describe("AppStore (preferred kbsync download)", func() {
 		Expect(errors.Is(err, context.Canceled)).To(BeTrue())
 	})
 
-	It("preserves unpinned legacy downloads when the preferred offer lookup fails", func() {
+	It("preserves unpinned legacy downloads when the preferred endpoint fails", func() {
 		gomock.InOrder(
 			bags.EXPECT().Send(gomock.Any()).Return(http.Result[bagResult]{StatusCode: gohttp.StatusOK, Data: bag}, nil),
-			platforms.EXPECT().Send(gomock.Any()).Return(http.Result[platformVersionLookupResult]{}, errors.New("catalog unavailable")),
+			downloads.EXPECT().Send(gomock.Any()).Return(empty, nil),
 			downloads.EXPECT().Send(gomock.Any()).Do(func(req http.Request) {
 				Expect(req.URL).To(ContainSubstring("volumeStoreDownloadProduct"))
 				Expect(req.Payload.(*http.XMLPayload).Content).NotTo(HaveKey("externalVersionId"))
@@ -373,16 +378,15 @@ var _ = Describe("AppStore (preferred kbsync download)", func() {
 		actual, _, err := store.sendDownloadProduct(context.Background(), account, app, guid, "", PlatformIPhone)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(actual).To(Equal(success))
-		Expect(generated).To(BeZero())
+		Expect(generated).To(Equal(1))
 	})
 
-	It("reaches unpinned redownload after the preferred catalog lookup and volumeStore miss", func() {
+	It("reaches unpinned redownload after the preferred endpoint and volumeStore miss", func() {
 		bag.URLBag.RedownloadEndpoint = testRedownloadEndpoint
 		bag.URLBag.UpdateEndpoint = testUpdateEndpoint
 		gomock.InOrder(
 			bags.EXPECT().Send(gomock.Any()).Return(http.Result[bagResult]{StatusCode: gohttp.StatusOK, Data: bag}, nil),
-			platforms.EXPECT().Send(gomock.Any()).Return(http.Result[platformVersionLookupResult]{StatusCode: gohttp.StatusOK}, nil).Times(3),
-			platforms.EXPECT().Send(gomock.Any()).Return(http.Result[platformVersionLookupResult]{StatusCode: gohttp.StatusNotFound}, nil),
+			downloads.EXPECT().Send(gomock.Any()).Return(empty, nil),
 			downloads.EXPECT().Send(gomock.Any()).Do(func(req http.Request) {
 				Expect(req.URL).To(ContainSubstring("volumeStoreDownloadProduct"))
 				Expect(req.Payload.(*http.XMLPayload).Content).NotTo(HaveKey("externalVersionId"))
@@ -398,7 +402,7 @@ var _ = Describe("AppStore (preferred kbsync download)", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(actual).To(Equal(success))
 		Expect(platform).To(Equal(PlatformIPhone))
-		Expect(generated).To(BeZero())
+		Expect(generated).To(Equal(1))
 	})
 
 	It("does not send credentials to an invalid preferred endpoint and falls back", func() {
@@ -557,7 +561,7 @@ var _ = Describe("AppStore (preferred kbsync download)", func() {
 			Expect(saved).To(Equal(1))
 		},
 			Entry("server error", "HTTP 500"), Entry("non-plist error", "HTML 403"), Entry("request timeout", "timeout"),
-			Entry("empty response", "empty"), Entry("availability error", "unavailable"), Entry("Apple failure", "structured failure"),
+			Entry("empty response", "empty"), Entry("availability error", "unavailable"),
 			Entry("missing URL", "missing URL"), Entry("wrong version", "wrong version"),
 		)
 
@@ -584,9 +588,21 @@ var _ = Describe("AppStore (preferred kbsync download)", func() {
 		},
 			Entry("server error", "HTTP 500", true), Entry("non-plist error", "HTML 403", true), Entry("timeout", "timeout", true),
 			Entry("empty response", "empty", true), Entry("availability error", "unavailable", true),
-			Entry("Apple failure", "structured failure", true), Entry("missing URL", "missing URL", true), Entry("wrong version", "wrong version", true),
-			Entry("no existing cache", "HTTP 500", false), Entry("uncached Apple failure", "structured failure", false),
+			Entry("missing URL", "missing URL", true), Entry("wrong version", "wrong version", true),
+			Entry("no existing cache", "HTTP 500", false),
 		)
+
+		It("keeps a valid cached blob when the account needs an app license", func() {
+			response := http.Result[downloadResult]{StatusCode: gohttp.StatusOK, Data: downloadResult{FailureType: FailureTypeLicenseNotFound}}
+			request(cachedBlob).Return(response, nil)
+			actual, _, err := store.sendDownloadProduct(context.Background(), account, app, guid, versionID, PlatformIPhone)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(actual.Data.FailureType).To(Equal(FailureTypeLicenseNotFound))
+			Expect(generated).To(BeZero())
+			Expect(removed).To(BeZero())
+			Expect(saved).To(BeZero())
+			Expect(store.cachedKBSync(dsid, guid)).To(Equal(cachedBlob))
+		})
 
 		It("falls back when regeneration fails", func() {
 			store.kbsyncGenerator = func(context.Context, []byte, uint64) ([]byte, error) {

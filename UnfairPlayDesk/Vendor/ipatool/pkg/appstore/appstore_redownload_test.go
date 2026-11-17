@@ -57,7 +57,12 @@ var _ = Describe("Redownloading delisted iOS apps", func() {
 				"softwareVersionExternalIdentifier": uint64(1001), "bundleShortVersionString": "1.0",
 			}}},
 		}}
-		primary := downloads.EXPECT().Send(store.downloadProductRequest(store.volumeStoreEndpoint(input.Account), input.Account, input.App, guid, "")).
+		primary := downloads.EXPECT().Send(gomock.Any()).Do(func(req http.Request) {
+			expected := store.downloadProductRequest(store.volumeStoreEndpoint(input.Account), input.Account, input.App, guid, "")
+			expected.Context = req.Context
+			Expect(req).To(Equal(expected))
+			Expect(req.Context).NotTo(BeNil())
+		}).
 			Return(http.Result[downloadResult]{StatusCode: gohttp.StatusOK}, nil)
 		bagCall = bags.EXPECT().Send(gomock.Any()).After(primary).Return(http.Result[bagResult]{
 			StatusCode: gohttp.StatusOK,

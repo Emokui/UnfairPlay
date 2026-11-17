@@ -56,7 +56,7 @@ var _ = Describe("AppStore (patch finalization)", func() {
 		// The patched archive stays buffered until Close, where the read-only
 		// destination descriptor rejects the write.
 		store := &appstore{os: readOnlyDestinationOS{OperatingSystem: operatingsystem.New(), destination: dst}}
-		err = store.applyPatches(downloadItemResult{Metadata: map[string]interface{}{}}, Account{}, src, dst, nil)
+		err = store.applyPatches(downloadItemResult{Metadata: map[string]interface{}{}}, Account{}, src, dst, nil, false)
 		Expect(err).To(MatchError(ContainSubstring("failed to close zip writer")))
 		var pathErr *os.PathError
 		Expect(errors.As(err, &pathErr)).To(BeTrue())

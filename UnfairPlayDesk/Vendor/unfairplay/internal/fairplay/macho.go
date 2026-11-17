@@ -7,6 +7,7 @@ import (
 	"crypto/sha512"
 	"encoding/binary"
 	"fmt"
+	"io"
 )
 
 const (
@@ -104,6 +105,30 @@ func machoArchitecture(cpuType, cpuSubtype uint32) string {
 	default:
 		return fmt.Sprintf("cpu-%#x", cpuType)
 	}
+}
+
+func readThinMachOProbe(reader io.Reader, header []byte, size uint64) ([]byte, error) {
+	magic := binary.LittleEndian.Uint32(header[:4])
+	headerBytes := 28
+	if magic == mhMagic64 {
+		headerBytes = 32
+	}
+	if len(header) < headerBytes {
+		return header, nil
+	}
+	commandsBytes := int(binary.LittleEndian.Uint32(header[20:24]))
+	required := headerBytes + commandsBytes
+	if required < headerBytes || required > 1024*1024 || uint64(required) > size {
+		return header, fmt.Errorf("Mach-O load-command extent is invalid")
+	}
+	probe := make([]byte, required)
+	copy(probe, header)
+	if required > len(header) {
+		if _, err := io.ReadFull(reader, probe[len(header):]); err != nil {
+			return probe, err
+		}
+	}
+	return probe, nil
 }
 
 func parseThinMachO(blob []byte, totalSize uint64) (machoLayout, error) {
@@ -286,36 +311,72 @@ func parseMachOSlices(blob []byte, totalSize uint64) ([]machoSlice, error) {
 	if uint64(len(blob)) != totalSize {
 		return nil, fmt.Errorf("universal Mach-O must be read completely")
 	}
-	magic := binary.BigEndian.Uint32(blob[:4])
+	specs, err := parseFatMachOTable(blob, totalSize)
+	if err != nil {
+		return nil, err
+	}
+	slices := make([]machoSlice, 0, len(specs))
+	for _, spec := range specs {
+		layout, err := spec.parseLayout(blob[spec.offset : spec.offset+spec.size])
+		if err != nil {
+			return nil, err
+		}
+		slices = append(slices, machoSlice{offset: spec.offset, size: spec.size, layout: layout})
+	}
+	return slices, nil
+}
+
+type machoSliceSpec struct {
+	offset, size        uint64
+	cpuType, cpuSubtype uint32
+	index               int
+}
+
+func (s machoSliceSpec) parseLayout(header []byte) (machoLayout, error) {
+	layout, err := parseThinMachO(header, s.size)
+	if err != nil {
+		return layout, fmt.Errorf("universal Mach-O architecture %d: %w", s.index, err)
+	}
+	if layout.cpuType != s.cpuType || layout.cpuSubtype != s.cpuSubtype {
+		return layout, fmt.Errorf("universal Mach-O architecture %d does not match its slice", s.index)
+	}
+	return layout, nil
+}
+
+func fatMachOTableFormat(header []byte) (binary.ByteOrder, int) {
+	magic := binary.BigEndian.Uint32(header[:4])
 	var order binary.ByteOrder = binary.BigEndian
 	if magic == fatCigam || magic == fatCigam64 {
 		order = binary.LittleEndian
 	}
-	is64 := magic == fatMagic64 || magic == fatCigam64
-	entrySize := 20
-	if is64 {
-		entrySize = 32
+	if magic == fatMagic64 || magic == fatCigam64 {
+		return order, 32
 	}
+	return order, 20
+}
+
+func parseFatMachOTable(blob []byte, totalSize uint64) ([]machoSliceSpec, error) {
 	if len(blob) < 8 {
 		return nil, fmt.Errorf("universal Mach-O header is truncated")
 	}
+	order, entrySize := fatMachOTableFormat(blob)
 	count := int(order.Uint32(blob[4:8]))
 	if count == 0 || count > 32 || count > (len(blob)-8)/entrySize {
 		return nil, fmt.Errorf("universal Mach-O architecture count is invalid")
 	}
 	tableEnd := uint64(8 + count*entrySize)
-	slices := make([]machoSlice, 0, count)
+	slices := make([]machoSliceSpec, 0, count)
 	for index := 0; index < count; index++ {
 		entry := blob[8+index*entrySize : 8+(index+1)*entrySize]
 		cpuType, cpuSubtype := order.Uint32(entry[:4]), order.Uint32(entry[4:8])
 		var offset, size uint64
-		if is64 {
+		if entrySize == 32 {
 			offset, size = order.Uint64(entry[8:16]), order.Uint64(entry[16:24])
 		} else {
 			offset, size = uint64(order.Uint32(entry[8:12])), uint64(order.Uint32(entry[12:16]))
 		}
 		alignOffset := 16
-		if is64 {
+		if entrySize == 32 {
 			alignOffset = 24
 		}
 		align := order.Uint32(entry[alignOffset : alignOffset+4])
@@ -330,14 +391,7 @@ func parseMachOSlices(blob []byte, totalSize uint64) ([]machoSlice, error) {
 				return nil, fmt.Errorf("universal Mach-O architectures overlap")
 			}
 		}
-		layout, err := parseThinMachO(blob[offset:offset+size], size)
-		if err != nil {
-			return nil, fmt.Errorf("universal Mach-O architecture %d: %w", index, err)
-		}
-		if layout.cpuType != cpuType || layout.cpuSubtype != cpuSubtype {
-			return nil, fmt.Errorf("universal Mach-O architecture %d does not match its slice", index)
-		}
-		slices = append(slices, machoSlice{offset: offset, size: size, layout: layout})
+		slices = append(slices, machoSliceSpec{offset: offset, size: size, cpuType: cpuType, cpuSubtype: cpuSubtype, index: index})
 	}
 	return slices, nil
 }
