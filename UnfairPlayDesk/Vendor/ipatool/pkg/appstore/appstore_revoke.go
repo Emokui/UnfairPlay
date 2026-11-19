@@ -12,7 +12,21 @@ func (t *appstore) Revoke() error {
 	t.authStateMu.Lock()
 	defer t.authStateMu.Unlock()
 	t.anisetteState = nil
+	t.loginCompletedWithoutStoreAMD = false
 	t.authenticationHeaders = nil
+	t.bagMu.Lock()
+	t.cachedURLBag = nil
+	t.cachedBagGUID = ""
+	t.bagMu.Unlock()
+	if t.authBackend != nil {
+		t.authBackend.ClearBag()
+	}
+	t.kbsyncCache.mu.Lock()
+	defer t.kbsyncCache.mu.Unlock()
+	t.kbsyncCache.entry = kbsyncCacheEntry{}
+	if session, ok := t.keychain.(interface{ Revoke() error }); ok {
+		return session.Revoke()
+	}
 	stateErr := t.keychain.Remove(anisetteKeychainKey)
 	if errors.Is(stateErr, keyring.ErrKeyNotFound) || errors.Is(stateErr, fs.ErrNotExist) {
 		stateErr = nil
@@ -25,11 +39,6 @@ func (t *appstore) Revoke() error {
 	} else if accountErr != nil {
 		accountErr = fmt.Errorf("failed to remove account from keychain: %w", accountErr)
 	}
-
-	t.kbsyncCache.mu.Lock()
-	defer t.kbsyncCache.mu.Unlock()
-
-	t.kbsyncCache.entry = kbsyncCacheEntry{}
 
 	cacheErr := t.keychain.Remove(kbsyncCacheKey)
 	if errors.Is(cacheErr, keyring.ErrKeyNotFound) || errors.Is(cacheErr, fs.ErrNotExist) {

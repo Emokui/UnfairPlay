@@ -9,6 +9,8 @@ import (
 	gohttp "net/http"
 	"time"
 
+	"github.com/byteness/keyring"
+	storebackend "github.com/majd/ipatool/v2/internal/store"
 	"github.com/majd/ipatool/v2/pkg/http"
 	"github.com/majd/ipatool/v2/pkg/keychain"
 	"github.com/majd/ipatool/v2/pkg/util/machine"
@@ -91,7 +93,11 @@ var _ = Describe("AppStore (preferred kbsync download)", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(actual.Data.FailureType).To(Equal(failure))
 		Expect(generated).To(Equal(1))
-		Expect(store.cachedKBSync(123456789012, guid)).To(BeEmpty())
+		if failure == FailureTypeLicenseNotFound {
+			Expect(store.cachedKBSync(123456789012, guid)).NotTo(BeEmpty())
+		} else {
+			Expect(store.cachedKBSync(123456789012, guid)).To(BeEmpty())
+		}
 	}, Entry("license", FailureTypeLicenseNotFound), Entry("expired token", FailureTypePasswordTokenExpired))
 
 	It("enables kbsync generation for normal clients", func() {
@@ -669,6 +675,56 @@ var _ = Describe("AppStore (preferred kbsync download)", func() {
 			Expect(removed).To(Equal(1))
 			Expect(saved).To(BeZero())
 			Expect(stored).To(BeNil())
+		})
+
+		DescribeTable("returns unprovisioned Store AMD without invalidating cache, generating kbsync, or falling back",
+			func(hasCache bool, state []byte) {
+				if !hasCache {
+					stored = nil
+				}
+				store.authBackend = storebackend.New(nil, nil)
+				store.anisetteState = state
+				if state == nil {
+					store.keychain.(*keychain.MockKeychain).EXPECT().Get(anisetteKeychainKey).Return(nil, keyring.ErrKeyNotFound).Times(1)
+				}
+				var stages []string
+				ctx := context.WithValue(context.Background(), downloadStageKey{}, func(msg string) {
+					stages = append(stages, msg)
+				})
+				_, _, err := store.sendDownloadProduct(ctx, account, app, guid, versionID, PlatformIPhone)
+				Expect(errors.Is(err, ErrStoreAMDNotProvisioned)).To(BeTrue())
+				Expect(IsSessionRefreshRequired(err)).To(BeTrue())
+				Expect(generated).To(BeZero())
+				Expect(removed).To(BeZero())
+				Expect(saved).To(BeZero())
+				Expect(stages).NotTo(ContainElement("正在请求备用下载接口"))
+				Expect(stages).NotTo(ContainElement("正在准备下载授权"))
+				if hasCache {
+					Expect(store.cachedKBSync(dsid, guid)).To(Equal(cachedBlob))
+				} else {
+					Expect(store.cachedKBSync(dsid, guid)).To(BeEmpty())
+				}
+			},
+			Entry("cached kbsync with missing keychain state", true, []byte(nil)),
+			Entry("cached kbsync with identity-only state", true, []byte(`{"Identifier":"AAECAwQFBgcICQoLDA0ODw=="}`)),
+			Entry("cached kbsync with machine Anisette state", true, []byte(`{"Identifier":"AAECAwQFBgcICQoLDA0ODw==","Provisioning":"bWFjaGluZQ==","RoutingInfo":123,"Kind":"machine"}`)),
+			Entry("uncached kbsync with missing keychain state", false, []byte(nil)),
+			Entry("uncached kbsync with identity-only state", false, []byte(`{"Identifier":"AAECAwQFBgcICQoLDA0ODw=="}`)),
+			Entry("uncached kbsync with machine Anisette state", false, []byte(`{"Identifier":"AAECAwQFBgcICQoLDA0ODw==","Provisioning":"bWFjaGluZQ==","RoutingInfo":123,"Kind":"machine"}`)),
+		)
+
+		It("returns unprovisioned Store AMD on volumeStore when ent/download is omitted", func() {
+			bag.URLBag.EntDownloadEndpoint = ""
+			bag.URLBag.RedownloadEndpoint = testRedownloadEndpoint
+			store.authBackend = storebackend.New(nil, nil)
+			store.anisetteState = []byte(`{"Identifier":"AAECAwQFBgcICQoLDA0ODw=="}`)
+			_, _, err := store.sendDownloadProduct(context.Background(), account, app, guid, versionID, PlatformIPhone)
+			Expect(errors.Is(err, ErrStoreAMDNotProvisioned)).To(BeTrue())
+			Expect(IsSessionRefreshRequired(err)).To(BeTrue())
+			Expect(generated).To(BeZero())
+			Expect(removed).To(BeZero())
+			Expect(saved).To(BeZero())
+			Expect(store.cachedKBSync(dsid, guid)).To(Equal(cachedBlob))
 		})
 	})
 })

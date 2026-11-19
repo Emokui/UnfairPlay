@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -78,5 +79,27 @@ func TestModelOnlyValidation(t *testing.T) {
 	var out bytes.Buffer
 	if run([]string{"--model", dir}, &out) == 0 {
 		t.Fatal("invalid registry returned success")
+	}
+}
+
+func TestModelSelectorMetadataOutput(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "model.bin")
+	if err := os.WriteFile(file, synthetic(2), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if run([]string{"--model", file}, &out) != 0 {
+		t.Fatal(out.String())
+	}
+	var result struct {
+		ModelCount  int             `json:"model_count"`
+		SelectorIDs []string        `json:"selector_ids"`
+		Checks      map[string]bool `json:"checks"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.ModelCount != 1 || !result.Checks["model_valid"] || len(result.SelectorIDs) != 1 || result.SelectorIDs[0] != "00000000:00000000" {
+		t.Fatalf("unexpected selector metadata: %+v", result)
 	}
 }

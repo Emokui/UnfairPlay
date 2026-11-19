@@ -1,12 +1,16 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	stdhttp "net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/byteness/keyring"
 	cookiejar "github.com/juju/persistent-cookiejar"
@@ -51,15 +55,43 @@ func newLogger(format OutputFormat, verbose bool) log.Logger {
 	)
 }
 
-// newCookieJar returns a new cookie jar instance.
+type sessionCookieJar struct {
+	*cookiejar.Jar
+	mu    sync.Mutex
+	dirty bool
+}
+
 func newCookieJar(stateDirectory string) http.CookieJar {
-	return util.Must(cookiejar.New(&cookiejar.Options{
+	return &sessionCookieJar{Jar: util.Must(cookiejar.New(&cookiejar.Options{
 		Filename: filepath.Join(stateDirectory, CookieJarFileName),
-	}))
+	}))}
+}
+
+func (j *sessionCookieJar) SetCookies(url *url.URL, cookies []*stdhttp.Cookie) {
+	if len(cookies) == 0 {
+		return
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.Jar.SetCookies(url, cookies)
+	j.dirty = true
+}
+
+func (j *sessionCookieJar) Save() error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if !j.dirty {
+		return nil
+	}
+	if err := j.Jar.Save(); err != nil {
+		return err
+	}
+	j.dirty = false
+	return nil
 }
 
 // newKeychain returns a new keychain instance.
-func newKeychain(stateDirectory string, interactive bool, serviceName string) keychain.Keychain {
+func newKeychain(ctx context.Context, stateDirectory string, interactive bool, serviceName string) keychain.Keychain {
 	ring := util.Must(openKeyring(keyring.Config{
 		AllowedBackends: []keyring.BackendType{
 			keyring.KeychainBackend,
@@ -88,10 +120,22 @@ func newKeychain(stateDirectory string, interactive bool, serviceName string) ke
 		},
 	}))
 
-	return keychain.New(keychain.Args{
+	legacy := keychain.New(keychain.Args{
 		Keyring: ring,
 		Label:   serviceName,
 	})
+	if sessionProfile == "" {
+		return legacy
+	}
+	if deskSessionFD >= 3 {
+		channel := os.NewFile(uintptr(deskSessionFD), "desktop-session")
+		if native, ok := ring.(interface{ desktopSessionFD(int) }); ok {
+			native.desktopSessionFD(deskSessionFD)
+			return keychain.NewDesktopSession(ctx, stateDirectory, serviceName, legacy, channel)
+		}
+		channel.Close()
+	}
+	return keychain.NewSession(ctx, stateDirectory, serviceName, legacy)
 }
 
 // initWithCommand initializes the dependencies of the command.
@@ -125,7 +169,7 @@ func initWithCommand(cmd *cobra.Command) {
 		}
 	}
 	dependencies.CookieJar = newCookieJar(stateDirectory)
-	dependencies.Keychain = newKeychain(stateDirectory, interactive, serviceName)
+	dependencies.Keychain = newKeychain(cmd.Context(), stateDirectory, interactive, serviceName)
 	dependencies.AppStore = appstore.NewAppStore(appstore.Args{
 		AuthenticationProgress: newStageReporter(),
 		CookieJar:              dependencies.CookieJar,

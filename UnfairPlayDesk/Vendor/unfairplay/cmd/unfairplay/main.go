@@ -37,11 +37,19 @@ func newRootCommand() *cobra.Command {
 }
 
 func newIPAStatusCommand() *cobra.Command {
-	return &cobra.Command{
+	var metadata bool
+	command := &cobra.Command{
 		Use:   "ipa-status <ipa>...",
 		Short: "Report Mach-O encryption markers in IPA files",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(_ *cobra.Command, paths []string) error {
+			if metadata {
+				items := make([]fairplay.IPAFileInfo, 0, len(paths))
+				for _, filename := range paths {
+					items = append(items, fairplay.InspectIPAFile(filename))
+				}
+				return printJSON(items)
+			}
 			type item struct {
 				Path   string `json:"path"`
 				Status string `json:"status"`
@@ -62,6 +70,8 @@ func newIPAStatusCommand() *cobra.Command {
 			return printJSON(items)
 		},
 	}
+	command.Flags().BoolVar(&metadata, "metadata", false, "Include app display metadata and non-secret selector hints")
+	return command
 }
 
 func printJSON(value any) error {

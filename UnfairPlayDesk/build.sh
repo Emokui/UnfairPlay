@@ -17,7 +17,7 @@ if [[ ! -x "$GO_TOOL" ]]; then GO_TOOL="$(command -v go)"; fi
 PROJECT_DIR="$PWD"
 (
   cd Vendor/ipatool
-  CLANG_MODULE_CACHE_PATH="$PROJECT_DIR/build/clang-cache" GOCACHE="$PROJECT_DIR/build/go-cache" GOMODCACHE="$PROJECT_DIR/build/go-mod" "$GO_TOOL" build -trimpath -buildvcs=false -ldflags '-X github.com/majd/ipatool/v2/cmd.version=2.8.0-desk.7' -o "$PROJECT_DIR/build/ipatool" .
+  CLANG_MODULE_CACHE_PATH="$PROJECT_DIR/build/clang-cache" GOCACHE="$PROJECT_DIR/build/go-cache" GOMODCACHE="$PROJECT_DIR/build/go-mod" "$GO_TOOL" build -trimpath -buildvcs=false -ldflags '-X github.com/majd/ipatool/v2/cmd.version=2.8.0-desk.9' -o "$PROJECT_DIR/build/ipatool" .
 )
 (
   cd Vendor/unfairplay
@@ -31,11 +31,11 @@ if [[ -n "$TOOLS" ]]; then ENGINE="$TOOLS/unfairplay"; fi
 cp build/modelcheck build/ipatool "$ENGINE" "$APP/Contents/Resources/Tools/"
 for binary in "$APP/Contents/Resources/Tools/modelcheck" "$APP/Contents/Resources/Tools/ipatool" "$APP/Contents/Resources/Tools/unfairplay"; do
   chmod 755 "$binary"
-  codesign --force --sign "$SIGNING_IDENTITY" "$binary"
+  codesign --force --sign "$SIGNING_IDENTITY" --identifier "local.unfairplay.${binary:t}" "$binary"
 done
 TOOL_SHA="$(shasum -a 256 "$APP/Contents/Resources/Tools/unfairplay" | cut -d ' ' -f 1)"
 clang -mmacosx-version-min=14.0 -Wno-deprecated-declarations -DDESK_ROOT_ONLY -DUNFAIRPLAY_SHA256=\"${TOOL_SHA}\" Sources/authorize.c -framework Security -framework CoreFoundation -o build/root-helper
-codesign --force --sign "$SIGNING_IDENTITY" build/root-helper
+codesign --force --sign "$SIGNING_IDENTITY" --identifier local.unfairplay.root-helper build/root-helper
 ROOT_SHA="$(shasum -a 256 build/root-helper | cut -d ' ' -f 1)"
 clang -mmacosx-version-min=14.0 -Wno-deprecated-declarations -DROOT_HELPER_SHA256=\"${ROOT_SHA}\" -DUNFAIRPLAY_SHA256=\"${TOOL_SHA}\" Sources/authorize.c -framework Security -framework CoreFoundation -o build/authorize
 clang -mmacosx-version-min=14.0 Sources/worker.c -o build/worker
@@ -46,11 +46,13 @@ mkdir -p "$APP/Contents/Resources/Licenses"
 cp Licenses/* "$APP/Contents/Resources/Licenses/"
 cp Info.plist "$APP/Contents/Info.plist"
 cp Assets/AppIcon.icns Assets/AppIcon.png "$APP/Contents/Resources/"
-for binary in "$APP/Contents/Resources/Tools/authorize" "$APP/Contents/Resources/Tools/worker" "$APP/Contents/MacOS/UnfairPlayDesk"; do
+chmod -R u=rwX,go=rX "$APP"
+for binary in "$APP/Contents/Resources/Tools/authorize" "$APP/Contents/Resources/Tools/worker"; do
   chmod 755 "$binary"
-  codesign --force --sign "$SIGNING_IDENTITY" "$binary"
+  codesign --force --sign "$SIGNING_IDENTITY" --identifier "local.unfairplay.${binary:t}" "$binary"
 done
 codesign --force --sign "$SIGNING_IDENTITY" "$APP"
+chmod 644 "$APP/Contents/_CodeSignature/CodeResources"
 codesign --verify --deep --strict "$APP"
 python3 - <<'PY'
 from pathlib import Path

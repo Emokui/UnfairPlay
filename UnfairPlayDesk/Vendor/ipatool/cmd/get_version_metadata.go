@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/avast/retry-go"
@@ -11,9 +12,15 @@ import (
 
 // nolint:wrapcheck
 func getVersionMetadataCmd() *cobra.Command {
+	return getVersionMetadataCmdWithAppStore(func() appstore.AppStore { return dependencies.AppStore })
+}
+
+// nolint:wrapcheck
+func getVersionMetadataCmdWithAppStore(appStore func() appstore.AppStore) *cobra.Command {
 	var (
 		appID             int64
 		bundleID          string
+		expectedAccount   string
 		externalVersionID string
 		platformValue     string
 	)
@@ -31,32 +38,40 @@ func getVersionMetadataCmd() *cobra.Command {
 				return err
 			}
 
+			store := appStore()
+			infoResult, err := store.AccountInfo()
+			if err != nil {
+				return err
+			}
+
+			acc := infoResult.Account
+			if expectedAccount != "" && !strings.EqualFold(strings.TrimSpace(expectedAccount), strings.TrimSpace(acc.Email)) {
+				return errors.New("version metadata account does not match selected profile")
+			}
 			var lastErr error
-			var acc appstore.Account
+			refreshed := false
+			interactive := isInteractive(cmd.Context())
+			stage := newStageReporter()
 
 			return retry.Do(func() error {
-				infoResult, err := dependencies.AppStore.AccountInfo()
-				if err != nil {
-					return err
-				}
-
-				acc = infoResult.Account
-
-				if errors.Is(lastErr, appstore.ErrPasswordTokenExpired) {
-					loginResult, err := dependencies.AppStore.Login(appstore.LoginInput{
-						Email:    acc.Email,
-						Password: acc.Password,
-					})
+				if appstore.IsSessionRefreshRequired(lastErr) {
+					refreshed = true
+					stage("正在更新 Apple 登录会话")
+					loginResult, err := refreshDownloadLogin(cmd.Context(), store, acc, interactive)
 					if err != nil {
-						return err
+						return wrapSessionRefreshError(lastErr, err)
+					}
+					if expectedAccount != "" && !strings.EqualFold(strings.TrimSpace(expectedAccount), strings.TrimSpace(loginResult.Account.Email)) {
+						return errors.New("version metadata account does not match selected profile after refreshing sign-in")
 					}
 
 					acc = loginResult.Account
+					emitRefreshedSession(acc)
 				}
 
 				app := appstore.App{ID: appID}
 				if bundleID != "" {
-					lookupResult, err := dependencies.AppStore.Lookup(appstore.LookupInput{Account: acc, BundleID: bundleID, Platform: platform})
+					lookupResult, err := store.Lookup(appstore.LookupInput{Account: acc, BundleID: bundleID, Platform: platform})
 					if err != nil {
 						return err
 					}
@@ -64,7 +79,7 @@ func getVersionMetadataCmd() *cobra.Command {
 					app = lookupResult.App
 				}
 
-				out, err := dependencies.AppStore.GetVersionMetadata(appstore.GetVersionMetadataInput{
+				out, err := store.GetVersionMetadata(appstore.GetVersionMetadataInput{
 					Context:   cmd.Context(),
 					Account:   acc,
 					App:       app,
@@ -75,12 +90,15 @@ func getVersionMetadataCmd() *cobra.Command {
 					return err
 				}
 
-				dependencies.Logger.Log().
+				event := dependencies.Logger.Log().
 					Str("externalVersionID", externalVersionID).
 					Str("displayVersion", out.DisplayVersion).
 					Time("releaseDate", out.ReleaseDate).
-					Bool("success", true).
-					Send()
+					Bool("success", true)
+				if refreshed {
+					event = event.Str("email", acc.Email).Str("storeFront", acc.StoreFront)
+				}
+				event.Send()
 
 				return nil
 			},
@@ -91,7 +109,7 @@ func getVersionMetadataCmd() *cobra.Command {
 				retry.RetryIf(func(err error) bool {
 					lastErr = err
 
-					return errors.Is(err, appstore.ErrPasswordTokenExpired)
+					return !refreshed && appstore.IsSessionRefreshRequired(err)
 				}),
 			)
 		},
@@ -102,6 +120,7 @@ func getVersionMetadataCmd() *cobra.Command {
 	cmd.Flags().StringVar(&externalVersionID, "external-version-id", "", "External version identifier of the target app (required)")
 
 	cmd.Flags().StringVar(&platformValue, "platform", "", "Platform to retrieve metadata for: iphone (iOS), ipad (iPadOS), appletv (tvOS), watchos, visionos, or macos")
+	cmd.Flags().StringVar(&expectedAccount, "expected-account", "", "Expected account identity for the selected desktop profile")
 
 	_ = cmd.MarkFlagRequired("external-version-id")
 

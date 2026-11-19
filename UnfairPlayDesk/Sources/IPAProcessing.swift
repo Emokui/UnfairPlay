@@ -48,6 +48,7 @@ extension ContentView {
                     DownloadedIPA.save(remainingDownloads)
                 }
                 refreshIPAReferences()
+                ipaFolderRevision += 1
                 if !failures.isEmpty {
                     alertText = "\(failures.count) 份 IPA 未能移到废纸篓。\n\n" + failures.prefix(4).joined(separator: "\n")
                 }
@@ -64,10 +65,14 @@ extension ContentView {
         let inputs = verifyOnly ? inputIPAs : decryptableIPAs
         guard let first = inputs.first else { return }
         let batch = inputs.count > 1
+        let automatic = saveIPAsDirectly
 
         let destination: URL?
         if verifyOnly {
             destination = nil
+        } else if saveIPAsDirectly {
+            guard let folder = downloadDirectory() else { return }
+            destination = folder
         } else if batch {
             let picker = NSOpenPanel()
             picker.directoryURL = defaultDownloadFolder
@@ -98,18 +103,20 @@ extension ContentView {
         }
 
         Task { @MainActor in
-            guard !runner.busy else { return }
+            guard let batchToken = runner.beginBatch(verifyOnly ? "正在验证 IPA" : "正在解密 IPA") else { return }
             if !verifyOnly { completionNotice = nil }
             var completed = 0
             var cancelled = false
             var issues: [String] = []
-            defer { ipaBatchPosition = nil }
+            var outputs: [URL] = []
+            defer { ipaBatchPosition = nil; runner.finishBatch(batchToken) }
 
             for (index, input) in inputs.enumerated() {
+                if runner.cancelled { cancelled = true; break }
                 if batch { ipaBatchPosition = "\(index + 1)/\(inputs.count)" }
                 do {
                     let target = try destination.map {
-                        if batch { return try unusedDecryptedTarget(for: input, in: $0) }
+                        if batch || automatic { return try unusedDecryptedTarget(for: input, in: $0) }
                         return try Core.OutputTarget($0)
                     }
                     let stage = try target.map { try WorkStage.create(beside: $0.url, root: store.root, accountID: accountID) }
@@ -125,7 +132,7 @@ extension ContentView {
                     if let stage { arguments += ["--output", stage.ipa.path, "--report", stage.report.path] }
                     let title = verifyOnly ? "正在验证 \(input.lastPathComponent)" : "正在解密 \(input.lastPathComponent)"
                     let ok = await withCheckedContinuation { continuation in
-                        runner.launch(tool("unfairplay"), arguments, title: title, holdsCompletion: true) {
+                        runner.launch(tool("unfairplay"), arguments, title: title, holdsCompletion: true, batchID: batchToken) {
                             continuation.resume(returning: $0)
                         }
                     }
@@ -152,7 +159,7 @@ extension ContentView {
                         }
                         completed += 1
                         let file = saved.standardizedFileURL
-                        if !recentIPAOutputs.contains(file) { recentIPAOutputs.append(file) }
+                        outputs.append(file)
                         do {
                             try Core.finalizeReport(stage.report, output: saved, accountID: accountID)
                             let report = try JSONSerialization.jsonObject(with: Data(contentsOf: stage.report))
@@ -168,6 +175,8 @@ extension ContentView {
                 }
             }
 
+            var known = Set(recentIPAOutputs)
+            recentIPAOutputs.append(contentsOf: outputs.filter { known.insert($0).inserted })
             if !verifyOnly { ipaFolderRevision += 1 }
             if cancelled || !issues.isEmpty {
                 var summary = verifyOnly ? "已通过验证 \(completed)/\(inputs.count) 份 IPA。" : "已保存 \(completed)/\(inputs.count) 份 IPA。"

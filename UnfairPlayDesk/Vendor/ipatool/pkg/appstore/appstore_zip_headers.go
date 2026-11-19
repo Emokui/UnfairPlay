@@ -2,6 +2,7 @@ package appstore
 
 import (
 	"archive/zip"
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"fmt"
@@ -29,7 +30,7 @@ const (
 // searching compressed data for local-header signatures.
 type zipLocalHeaders struct {
 	source    io.ReaderAt
-	directory *io.SectionReader
+	directory *bufio.Reader
 	base      int64
 }
 
@@ -61,7 +62,7 @@ func newZIPLocalHeaders(source io.ReaderAt, size int64) (*zipLocalHeaders, error
 
 	return &zipLocalHeaders{
 		source:    source,
-		directory: io.NewSectionReader(source, start, size-start),
+		directory: bufio.NewReaderSize(io.NewSectionReader(source, start, size-start), 64<<10),
 		base:      base,
 	}, nil
 }
@@ -140,14 +141,19 @@ func readZIP64DirectoryEnd(source io.ReaderAt, size int64, directory zipDirector
 	}, nil
 }
 
-func (r *zipLocalHeaders) extra(file *zip.File) ([]byte, error) {
+type zipLocalEntry struct {
+	extra      []byte
+	dataOffset int64
+}
+
+func (r *zipLocalHeaders) entry(file *zip.File) (zipLocalEntry, error) {
 	var central [zipCentralHeaderLen]byte
 	if _, err := io.ReadFull(r.directory, central[:]); err != nil {
-		return nil, fmt.Errorf("failed to read central header: %w", err)
+		return zipLocalEntry{}, fmt.Errorf("failed to read central header: %w", err)
 	}
 
 	if binary.LittleEndian.Uint32(central[:]) != zipCentralHeaderSignature {
-		return nil, zip.ErrFormat
+		return zipLocalEntry{}, zip.ErrFormat
 	}
 
 	nameLen := int(binary.LittleEndian.Uint16(central[28:]))
@@ -156,20 +162,20 @@ func (r *zipLocalHeaders) extra(file *zip.File) ([]byte, error) {
 
 	metadata := make([]byte, nameLen+extraLen+commentLen)
 	if _, err := io.ReadFull(r.directory, metadata); err != nil {
-		return nil, fmt.Errorf("failed to read central metadata: %w", err)
+		return zipLocalEntry{}, fmt.Errorf("failed to read central metadata: %w", err)
 	}
 
 	if string(metadata[:nameLen]) != file.Name {
-		return nil, zip.ErrFormat
+		return zipLocalEntry{}, zip.ErrFormat
 	}
 
 	offset, err := zipLocalHeaderOffset(central[:], metadata[nameLen:nameLen+extraLen])
 	if err != nil {
-		return nil, err
+		return zipLocalEntry{}, err
 	}
 
 	if offset > uint64(math.MaxInt64-r.base) {
-		return nil, zip.ErrFormat
+		return zipLocalEntry{}, zip.ErrFormat
 	}
 
 	localOffset := r.base + int64(offset)
@@ -177,11 +183,11 @@ func (r *zipLocalHeaders) extra(file *zip.File) ([]byte, error) {
 	var local [zipLocalHeaderLen]byte
 
 	if _, err := r.source.ReadAt(local[:], localOffset); err != nil {
-		return nil, fmt.Errorf("failed to read local header: %w", err)
+		return zipLocalEntry{}, fmt.Errorf("failed to read local header: %w", err)
 	}
 
 	if binary.LittleEndian.Uint32(local[:]) != zipLocalHeaderSignature {
-		return nil, zip.ErrFormat
+		return zipLocalEntry{}, zip.ErrFormat
 	}
 
 	localNameLen := int(binary.LittleEndian.Uint16(local[26:]))
@@ -189,23 +195,23 @@ func (r *zipLocalHeaders) extra(file *zip.File) ([]byte, error) {
 
 	dataOffset, err := file.DataOffset()
 	if err != nil {
-		return nil, fmt.Errorf("failed to locate entry data: %w", err)
+		return zipLocalEntry{}, fmt.Errorf("failed to locate entry data: %w", err)
 	}
 
 	if dataOffset-localOffset != int64(zipLocalHeaderLen+localNameLen+localExtraLen) {
-		return nil, zip.ErrFormat
+		return zipLocalEntry{}, zip.ErrFormat
 	}
 
 	localMetadata := make([]byte, localNameLen+localExtraLen)
 	if _, err := r.source.ReadAt(localMetadata, localOffset+zipLocalHeaderLen); err != nil {
-		return nil, fmt.Errorf("failed to read local metadata: %w", err)
+		return zipLocalEntry{}, fmt.Errorf("failed to read local metadata: %w", err)
 	}
 
 	if !bytes.Equal(localMetadata[:localNameLen], metadata[:nameLen]) {
-		return nil, zip.ErrFormat
+		return zipLocalEntry{}, zip.ErrFormat
 	}
 
-	return localMetadata[localNameLen:], nil
+	return zipLocalEntry{extra: localMetadata[localNameLen:], dataOffset: dataOffset}, nil
 }
 
 // ZIP64 central-directory offsets belong to the source archive. Let zip.Writer

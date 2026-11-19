@@ -45,8 +45,18 @@ var _ = Describe("Store memory grouping", func() {
 	})
 	It("still rejects execution in padding outside the pinned code", func() {
 		guest := &Runtime{codeRanges: [][2]uint64{{0x1000, 0x2000}}}
-		guest.step(0x3000, 4)
+		guest.checkBlock(0x3000, 4)
 		Expect(guest.fault).To(MatchError(ContainSubstring("execution outside the pinned image")))
+	})
+	It("checks the full block and accepts only single-instruction bridges outside the pinned code", func() {
+		guest := &Runtime{codeRanges: [][2]uint64{{0x1000, 0x2000}}, calls: map[uint64]Call{0x3000: {}}}
+		guest.checkBlock(0x3000, 4)
+		Expect(guest.fault).To(Succeed())
+		guest.checkBlock(0x3000, 8)
+		Expect(guest.fault).To(HaveOccurred())
+		guest.fault = nil
+		guest.checkBlock(0x1ffc, 8)
+		Expect(guest.fault).To(HaveOccurred())
 	})
 })
 

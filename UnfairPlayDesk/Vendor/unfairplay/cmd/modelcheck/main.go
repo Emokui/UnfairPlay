@@ -15,21 +15,26 @@ import (
 )
 
 func check(path string) (int, error) {
+	count, _, err := inspect(path)
+	return count, err
+}
+
+func inspect(path string) (int, []string, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	if info.Mode()&os.ModeSymlink != 0 {
-		return 0, fmt.Errorf("model path must not be a symlink")
+		return 0, nil, fmt.Errorf("model path must not be a symlink")
 	}
 	paths := []string{path}
 	if info.IsDir() {
 		if info.Mode().Perm()&0077 != 0 {
-			return 0, fmt.Errorf("model directory must be private (0700)")
+			return 0, nil, fmt.Errorf("model directory must be private (0700)")
 		}
 		entries, err := os.ReadDir(path)
 		if err != nil {
-			return 0, err
+			return 0, nil, err
 		}
 		paths = nil
 		for _, entry := range entries {
@@ -37,27 +42,32 @@ func check(path string) (int, error) {
 				continue
 			}
 			if entry.Type()&os.ModeSymlink != 0 || entry.IsDir() {
-				return 0, fmt.Errorf("model entry must be a regular file")
+				return 0, nil, fmt.Errorf("model entry must be a regular file")
 			}
 			paths = append(paths, filepath.Join(path, entry.Name()))
 		}
 	}
 	if len(paths) == 0 || len(paths) > 256 {
-		return 0, fmt.Errorf("model count must be between 1 and 256")
+		return 0, nil, fmt.Errorf("model count must be between 1 and 256")
 	}
+	selectors := make([]string, 0, len(paths))
 	for _, file := range paths {
 		st, err := os.Lstat(file)
 		if err != nil {
-			return 0, err
+			return 0, nil, err
 		}
 		if !st.Mode().IsRegular() || st.Size() > 16<<20 {
-			return 0, fmt.Errorf("model is not a bounded regular file")
+			return 0, nil, fmt.Errorf("model is not a bounded regular file")
 		}
-		if _, err := fairplay.InspectEnrollmentModel(file); err != nil {
-			return 0, err
+		model, err := fairplay.InspectEnrollmentModel(file)
+		if err != nil {
+			return 0, nil, err
+		}
+		if model.SelectorID != "" {
+			selectors = append(selectors, model.SelectorID)
 		}
 	}
-	return len(paths), nil
+	return len(paths), selectors, nil
 }
 func run(args []string, out io.Writer) int {
 	flags := flag.NewFlagSet("modelcheck", flag.ContinueOnError)
@@ -69,8 +79,8 @@ func run(args []string, out io.Writer) int {
 		}
 		return 2
 	}
-	count, err := check(*model)
-	result := map[string]any{"schema": "desk-model-check-v1", "checks": map[string]bool{"model_valid": err == nil}, "model_count": count}
+	count, selectors, err := inspect(*model)
+	result := map[string]any{"schema": "desk-model-check-v1", "checks": map[string]bool{"model_valid": err == nil}, "model_count": count, "selector_ids": selectors}
 	if err != nil {
 		result["error"] = err.Error()
 	}

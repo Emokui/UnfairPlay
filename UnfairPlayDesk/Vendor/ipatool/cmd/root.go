@@ -11,6 +11,7 @@ import (
 )
 
 var version = "dev"
+var deskSessionFD = -1
 
 type contextKey string
 
@@ -33,6 +34,9 @@ func rootCmd() *cobra.Command {
 			if err := validateSessionProfile(sessionProfile); err != nil {
 				return err
 			}
+			if deskSessionFD != -1 && (deskSessionFD != 3 || sessionProfile == "") {
+				return errors.New("desktop session channel requires fd 3 and a named profile")
+			}
 			ctx := context.WithValue(cmd.Context(), interactiveKey, !nonInteractive)
 			cmd.SetContext(ctx)
 			initWithCommand(cmd)
@@ -50,6 +54,8 @@ func rootCmd() *cobra.Command {
 	cmd.PersistentFlags().StringVar(&keychainPassphrase, "keychain-passphrase", "", "passphrase for unlocking keychain")
 	cmd.PersistentFlags().StringVar(&sessionProfile, "profile", "", "Isolated session profile UUID (UnfairPlay Desk)")
 
+	cmd.PersistentFlags().IntVar(&deskSessionFD, "desk-session-fd", -1, "private desktop session channel")
+	_ = cmd.PersistentFlags().MarkHidden("desk-session-fd")
 	cmd.AddCommand(authCmd())
 	cmd.AddCommand(downloadCmd())
 	cmd.AddCommand(listPurchasesCmd())

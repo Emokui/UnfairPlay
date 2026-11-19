@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -237,6 +238,7 @@ var _ = Describe("Download command", func() {
 		}
 	},
 		Entry("refreshes an expired token", []error{appstore.ErrPasswordTokenExpired, nil}, 0),
+		Entry("refreshes when Store AMD is unprovisioned", []error{fmt.Errorf("generate Store AMD proof: %w", appstore.ErrStoreAMDNotProvisioned), nil}, 0),
 		Entry("retains the refreshed token for a subsequent purchase", []error{appstore.ErrPasswordTokenExpired, appstore.ErrLicenseRequired, nil}, 1),
 	)
 
@@ -251,6 +253,26 @@ var _ = Describe("Download command", func() {
 		Expect(store.lookupInputs).To(BeEmpty())
 		Expect(store.purchaseInputs).To(BeEmpty())
 		Expect(store.downloadInputs).To(BeEmpty())
+	})
+
+	It("emits refreshed storefront immediately even when a later download step fails", func() {
+		var buf bytes.Buffer
+		store := &fakeDownloadAppStore{
+			account:        appstore.Account{Email: "user@example.com", Password: "secret", StoreFront: "143441"},
+			loginAccount:   appstore.Account{Email: "user@example.com", Password: "secret", StoreFront: "143462-1,32"},
+			downloadErrors: []error{appstore.ErrPasswordTokenExpired, appstore.ErrLicenseRequired},
+		}
+		previousDependencies := dependencies
+		DeferCleanup(func() { dependencies = previousDependencies })
+		dependencies.Logger = log.NewLogger(log.Args{Writer: &buf})
+
+		cmd := downloadCmdWithAppStore(func() appstore.AppStore { return store })
+		cmd.SetArgs([]string{"--app-id", "42", "--expected-account", "user@example.com"})
+		cmd.SetContext(context.WithValue(context.Background(), interactiveKey, false))
+
+		Expect(cmd.Execute()).To(MatchError(appstore.ErrLicenseRequired))
+		Expect(buf.String()).To(ContainSubstring(`"sessionRefreshed":true`))
+		Expect(buf.String()).To(ContainSubstring(`"storeFront":"143462-1,32"`))
 	})
 })
 

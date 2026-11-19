@@ -1,7 +1,10 @@
 package machimage
 
 import (
+	"crypto/sha256"
 	"math"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -145,5 +148,33 @@ func TestRelocateRejectsFixupsOutsideTheirSegments(t *testing.T) {
 				t.Fatalf("Relocate() error = %v, want file-data bounds error", err)
 			}
 		})
+	}
+}
+
+func TestOpenSharedVerifiedReusesCachedPreparation(t *testing.T) {
+	cacheRoot, err := os.UserCacheDir()
+	if err != nil {
+		t.Skip("no user cache directory")
+	}
+	assetPath := filepath.Join(cacheRoot, "ipatool", "sap", "apple-assets-macos-27-26A434-arm64-v5", "AppleMediaServices")
+	data, err := os.ReadFile(assetPath)
+	if err != nil {
+		t.Skipf("cached AppleMediaServices not present: %v", err)
+	}
+
+	digest := sha256.Sum256(data)
+	first, err := OpenSharedVerified("AppleMediaServices", data, digest)
+	if err != nil {
+		t.Fatalf("first OpenSharedVerified() error = %v", err)
+	}
+	second, err := OpenSharedVerified("AppleMediaServices", data, digest)
+	if err != nil {
+		t.Fatalf("second OpenSharedVerified() error = %v", err)
+	}
+	if first.sharedDigest != digest || second.sharedDigest != digest {
+		t.Fatalf("sharedDigest mismatch: %x vs %x", first.sharedDigest, second.sharedDigest)
+	}
+	if len(first.segments) == 0 || len(first.segments) != len(second.segments) {
+		t.Fatalf("unexpected segment counts: %d vs %d", len(first.segments), len(second.segments))
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 )
 
@@ -83,6 +84,18 @@ func writeMultiSINFArchive(t *testing.T, name string, members map[string][]byte)
 		"Payload/Test.app/PlugIns/Widget.appex/SC_Info/Test.sinf",
 		"Payload/Test.app/PlugIns/Widget.appex/SC_Info/Test.supf",
 	}
+	ordered := make(map[string]bool, len(order))
+	for _, member := range order {
+		ordered[member] = true
+	}
+	var remaining []string
+	for member := range members {
+		if !ordered[member] {
+			remaining = append(remaining, member)
+		}
+	}
+	sort.Strings(remaining)
+	order = append(order, remaining...)
 	for _, member := range order {
 		data, ok := members[member]
 		if !ok {
@@ -274,5 +287,29 @@ func TestSINFNameFallsBackToContainingApp(t *testing.T) {
 func TestAdjacentSINFTopLevel(t *testing.T) {
 	if got := adjacentSINF("App"); got != "SC_Info/App.sinf" {
 		t.Fatalf("top-level license path: %s", got)
+	}
+}
+
+func TestWriteMultiSINFArchiveIncludesExtraMembers(t *testing.T) {
+	filename := filepath.Join(t.TempDir(), "Synthetic.ipa")
+	members := map[string][]byte{
+		"z-extra":               []byte("last"),
+		"Payload/Test.app/Test": []byte("first"),
+		"a-extra":               []byte("middle"),
+	}
+	writeMultiSINFArchive(t, filename, members)
+	archive, err := zip.OpenReader(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer archive.Close()
+	want := []string{"Payload/Test.app/Test", "a-extra", "z-extra"}
+	if len(archive.File) != len(want) || len(members) != len(want) {
+		t.Fatal("archive helper dropped or consumed members")
+	}
+	for index, file := range archive.File {
+		if file.Name != want[index] {
+			t.Fatalf("member %d: %s, want %s", index, file.Name, want[index])
+		}
 	}
 }

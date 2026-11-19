@@ -14,7 +14,10 @@ static void stop(int signal) { stopping = signal; }
 int main(int argc, char **argv) {
     if (argc < 4 || strcmp(argv[1], "--parent")) return 2;
     pid_t parent = (pid_t)strtol(argv[2], NULL, 10);
-    if (parent <= 1 || getppid() != parent || argv[3][0] != '/') return 2;
+    int session = strcmp(argv[3], "--session-channel") == 0;
+    int tool = session ? 4 : 3;
+    if (tool >= argc) return 2;
+    if (parent <= 1 || getppid() != parent || argv[tool][0] != '/') return 2;
     umask(0077);
     struct sigaction action = {0}; action.sa_handler = stop; sigemptyset(&action.sa_mask);
     sigaction(SIGTERM, &action, NULL); sigaction(SIGINT, &action, NULL); sigaction(SIGHUP, &action, NULL);
@@ -23,8 +26,12 @@ int main(int argc, char **argv) {
     if (child == 0) {
         setpgid(0, 0);
         signal(SIGTERM, SIG_DFL); signal(SIGINT, SIG_DFL); signal(SIGHUP, SIG_DFL);
-        execv(argv[3], &argv[3]); perror("启动工具失败"); _exit(127);
+        // Foundation passes the socket as stdin and the read/write PTY as stdout.
+        // Move the socket to fd 3 and restore interactive stdin before exec.
+        if (session && (dup2(STDIN_FILENO, 3) < 0 || dup2(STDOUT_FILENO, STDIN_FILENO) < 0)) _exit(126);
+        execv(argv[tool], &argv[tool]); perror("启动工具失败"); _exit(127);
     }
+    if (session) close(STDIN_FILENO);
     setpgid(child, child);
     int status = 0, ticks = 0;
     while (1) {

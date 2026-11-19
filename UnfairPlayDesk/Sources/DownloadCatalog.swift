@@ -68,14 +68,12 @@ struct CatalogHistoryVersion: Identifiable {
 }
 
 enum CatalogPurchaseStatus: Equatable {
-    case checking, owned, unowned, unavailable
+    case owned, unowned
 
     var text: String {
         switch self {
-        case .checking: "正在检查购买状态"
         case .owned: "已购买"
         case .unowned: "未购买"
-        case .unavailable: "购买状态暂不可用"
         }
     }
 }
@@ -219,7 +217,7 @@ enum CatalogService {
         var request = URLRequest(url: url)
         request.timeoutInterval = timeout
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("UnfairPlay/1.5.7", forHTTPHeaderField: "User-Agent")
+        request.setValue("UnfairPlay/\(UpdateChecker.currentVersion)", forHTTPHeaderField: "User-Agent")
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw DeskError("查询服务未返回有效响应。") }
         guard (200..<300).contains(http.statusCode) else {
@@ -228,14 +226,23 @@ enum CatalogService {
         return data
     }
     static func search(_ term: String, country: String, timeout: TimeInterval = 20) async throws -> [CatalogApp] {
-        let id = Core.appID(term)
-        var url = URLComponents(string: "https://itunes.apple.com/" + (id == nil ? "search" : "lookup"))!
-        url.queryItems = [URLQueryItem(name: id == nil ? "term" : "id", value: id ?? term), URLQueryItem(name: "country", value: country)]
-        if id == nil { url.queryItems! += [URLQueryItem(name: "entity", value: "software"), URLQueryItem(name: "limit", value: "20")] }
+        let query = term.trimmingCharacters(in: .whitespacesAndNewlines)
+        let id = Core.appID(query)
+        let bundleID = query.range(of: #"^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$"#, options: .regularExpression) != nil ? query : nil
+        let parameter = id != nil ? "id" : bundleID != nil ? "bundleId" : "term"
+        let endpoint = parameter == "term" ? "search" : "lookup"
+        var url = URLComponents(string: "https://itunes.apple.com/" + endpoint)!
+        url.queryItems = [URLQueryItem(name: parameter, value: id ?? bundleID ?? query), URLQueryItem(name: "country", value: country)]
+        if endpoint == "search" {
+            url.queryItems! += [URLQueryItem(name: "entity", value: "software"), URLQueryItem(name: "limit", value: "20")]
+        }
         struct Response: Decodable { let results: [CatalogApp] }
         let result = try JSONDecoder().decode(Response.self, from: await request(url.url!, timeout: timeout))
         var seen = Set<Int64>()
-        return result.results.filter { $0.id > 0 && (id == nil || String($0.id) == id) && seen.insert($0.id).inserted }
+        return result.results.filter {
+            $0.id > 0 && (id == nil || String($0.id) == id) &&
+                (bundleID == nil || $0.bundleID.lowercased() == bundleID?.lowercased()) && seen.insert($0.id).inserted
+        }
     }
     static func history(_ appID: String, source: VersionSource) async throws -> [CatalogHistoryVersion] {
         guard DownloadCatalog.numericID(appID) else { throw DeskError("请输入有效的 App ID。") }

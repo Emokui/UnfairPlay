@@ -78,21 +78,22 @@ func downloadCmdWithAppStore(appStore func() appstore.AppStore) *cobra.Command {
 			purchaseRequired := false
 			purchased := false
 			refreshed := false
-			interactive, _ := cmd.Context().Value(interactiveKey).(bool)
+			interactive := isInteractive(cmd.Context())
 
 			stage := newStageReporter()
 			return retry.Do(func() error {
-				if errors.Is(lastErr, appstore.ErrPasswordTokenExpired) {
+				if appstore.IsSessionRefreshRequired(lastErr) {
 					refreshed = true
 					stage("正在更新 Apple 登录会话")
 					loginResult, err := refreshDownloadLogin(cmd.Context(), store, acc, interactive)
 					if err != nil {
-						return fmt.Errorf("failed to refresh Apple login: %w", err)
+						return wrapSessionRefreshError(lastErr, err)
 					}
 					if expectedAccount != "" && !strings.EqualFold(strings.TrimSpace(expectedAccount), strings.TrimSpace(loginResult.Account.Email)) {
 						return errors.New("download account does not match selected profile after refreshing sign-in")
 					}
 					acc = loginResult.Account
+					emitRefreshedSession(acc)
 				}
 
 				app := appstore.App{ID: appID, BundleID: bundleID}
@@ -126,7 +127,7 @@ func downloadCmdWithAppStore(appStore func() appstore.AppStore) *cobra.Command {
 						Platform: platform,
 					})
 					if err != nil && !errors.Is(err, appstore.ErrLicenseAlreadyExists) {
-						if refreshed && errors.Is(err, appstore.ErrPasswordTokenExpired) {
+						if refreshed && appstore.IsSessionRefreshRequired(err) {
 							return fmt.Errorf("free app license rejected after sign-in refresh: %w", err)
 						}
 						return err
@@ -174,11 +175,14 @@ func downloadCmdWithAppStore(appStore func() appstore.AppStore) *cobra.Command {
 					return err
 				}
 
-				dependencies.Logger.Log().
+				event := dependencies.Logger.Log().
 					Str("output", out.DestinationPath).
 					Bool("purchased", purchased).
-					Bool("success", true).
-					Send()
+					Bool("success", true)
+				if refreshed {
+					event = event.Str("email", acc.Email).Str("storeFront", acc.StoreFront)
+				}
+				event.Send()
 
 				return nil
 			},
@@ -189,7 +193,7 @@ func downloadCmdWithAppStore(appStore func() appstore.AppStore) *cobra.Command {
 				retry.RetryIf(func(err error) bool {
 					lastErr = err
 
-					if errors.Is(err, appstore.ErrPasswordTokenExpired) {
+					if appstore.IsSessionRefreshRequired(err) {
 						return !refreshed
 					}
 
@@ -216,6 +220,14 @@ func downloadCmdWithAppStore(appStore func() appstore.AppStore) *cobra.Command {
 	return cmd
 }
 
+func isInteractive(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	interactive, _ := ctx.Value(interactiveKey).(bool)
+	return interactive
+}
+
 func refreshDownloadLogin(ctx context.Context, store appstore.AppStore, account appstore.Account, interactive bool) (appstore.LoginOutput, error) {
 	input := appstore.LoginInput{Context: ctx, Email: account.Email, Password: account.Password}
 	if input.Password == "" && interactive {
@@ -235,6 +247,27 @@ func refreshDownloadLogin(ctx context.Context, store appstore.AppStore, account 
 	}
 	input.AuthCode = code
 	return store.Login(input)
+}
+
+func emitRefreshedSession(acc appstore.Account) {
+	if dependencies.Logger == nil {
+		return
+	}
+	dependencies.Logger.Log().
+		Str("email", acc.Email).
+		Str("storeFront", acc.StoreFront).
+		Bool("sessionRefreshed", true).
+		Send()
+}
+
+func wrapSessionRefreshError(cause, err error) error {
+	if canProvideVerificationCode(err) ||
+		errors.Is(err, appstore.ErrInvalidCredentials) ||
+		errors.Is(err, appstore.ErrVerificationRejected) {
+		return fmt.Errorf("failed to refresh Apple login: %w", err)
+	}
+
+	return fmt.Errorf("failed to refresh Apple login (%w): %w", cause, err)
 }
 
 type sinfReplicator interface {

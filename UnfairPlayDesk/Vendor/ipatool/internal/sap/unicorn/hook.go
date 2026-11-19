@@ -8,7 +8,10 @@ import (
 	"github.com/ebitengine/purego"
 )
 
-const hookCode = 1 << 2
+const (
+	hookCode  = 1 << 2
+	hookBlock = 1 << 3
+)
 
 const hookUnmappedMemory = 1<<4 | 1<<5 | 1<<6
 
@@ -67,6 +70,15 @@ func (e *Engine) AddCodeHook(begin, end uint64, callback CodeHook) (*Hook, error
 	}
 
 	return e.addHook(hookCode, codeHookTrampoline, begin, end, callback)
+}
+
+// AddBlockHook calls back once per translated basic block before it executes.
+func (e *Engine) AddBlockHook(callback CodeHook) (*Hook, error) {
+	if callback == nil {
+		return nil, errors.New("unicorn block hook callback is nil")
+	}
+
+	return e.addHook(hookBlock, codeHookTrampoline, 0, ^uint64(0), callback)
 }
 
 // AddMemoryFaultHook supports demand loading verified cache pages during bootstrap.

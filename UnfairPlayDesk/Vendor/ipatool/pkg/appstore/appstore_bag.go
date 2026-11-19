@@ -77,6 +77,21 @@ func (t *appstore) bagContext(ctx context.Context, guid string) (BagOutput, erro
 
 // Download endpoints do not require the authentication-specific SAP configuration.
 func (t *appstore) fetchURLBagContext(ctx context.Context, guid string) (urlBag, error) {
+	if ctx != nil && ctx.Err() != nil {
+		return urlBag{}, ctx.Err()
+	}
+
+	if guid != "" {
+		t.bagMu.Lock()
+		if t.cachedURLBag != nil && strings.EqualFold(t.cachedBagGUID, guid) {
+			cached := *t.cachedURLBag
+			t.bagMu.Unlock()
+
+			return cached, nil
+		}
+		t.bagMu.Unlock()
+	}
+
 	request := t.bagRequest(guid)
 	request.Context = ctx
 	res, err := t.bagClient.Send(request)
@@ -88,23 +103,31 @@ func (t *appstore) fetchURLBagContext(ctx context.Context, guid string) (urlBag,
 		return urlBag{}, fmt.Errorf("received unexpected status code: %d", res.StatusCode)
 	}
 
-	bag := res.Data.URLBag
-	if bag.AuthEndpoint != "" || bag.EntDownloadEndpoint != "" ||
-		bag.RedownloadEndpoint != "" || bag.UpdateEndpoint != "" ||
-		bag.SAPSetupEndpoint != "" || bag.SAPSetupCertEndpoint != "" ||
-		bag.SAPVersion != "" {
-		return res.Data.URLBag, nil
+	resolved := res.Data.URLBag
+	if resolved.AuthEndpoint == "" && resolved.EntDownloadEndpoint == "" &&
+		resolved.RedownloadEndpoint == "" && resolved.UpdateEndpoint == "" &&
+		resolved.SAPSetupEndpoint == "" && resolved.SAPSetupCertEndpoint == "" &&
+		resolved.SAPVersion == "" {
+		resolved = urlBag{
+			AuthEndpoint:         res.Data.AuthEndpoint,
+			EntDownloadEndpoint:  res.Data.EntDownloadEndpoint,
+			RedownloadEndpoint:   res.Data.RedownloadEndpoint,
+			UpdateEndpoint:       res.Data.UpdateEndpoint,
+			SAPSetupEndpoint:     res.Data.SAPSetupEndpoint,
+			SAPSetupCertEndpoint: res.Data.SAPSetupCertEndpoint,
+			SAPVersion:           res.Data.SAPVersion,
+		}
 	}
 
-	return urlBag{
-		AuthEndpoint:         res.Data.AuthEndpoint,
-		EntDownloadEndpoint:  res.Data.EntDownloadEndpoint,
-		RedownloadEndpoint:   res.Data.RedownloadEndpoint,
-		UpdateEndpoint:       res.Data.UpdateEndpoint,
-		SAPSetupEndpoint:     res.Data.SAPSetupEndpoint,
-		SAPSetupCertEndpoint: res.Data.SAPSetupCertEndpoint,
-		SAPVersion:           res.Data.SAPVersion,
-	}, nil
+	if guid != "" {
+		t.bagMu.Lock()
+		cached := resolved
+		t.cachedURLBag = &cached
+		t.cachedBagGUID = guid
+		t.bagMu.Unlock()
+	}
+
+	return resolved, nil
 }
 
 type bagResult struct {

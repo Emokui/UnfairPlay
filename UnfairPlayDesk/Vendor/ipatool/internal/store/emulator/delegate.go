@@ -43,6 +43,13 @@ func (r *Runtime) installStoreAMDAdapter() {
 			panic(err)
 		}
 
+		if !r.dispatchPages[page] {
+			if _, err := r.engine.AddCodeHook(page, page+4095, r.step); err != nil {
+				panic(err)
+			}
+			r.dispatchPages[page] = true
+		}
+
 		r.callbacks[address] = callback
 	}
 

@@ -83,10 +83,8 @@ func loginCmd() *cobra.Command {
 					AuthCode: authCode,
 				})
 				if err != nil {
-					if errors.Is(err, appstore.ErrAuthCodeRequired) && !interactive {
-						dependencies.Logger.Log().Msg("2FA code is required; run the command again and supply a code using the `--auth-code` flag")
-
-						return nil
+					if !interactive && canProvideVerificationCode(err) {
+						return fmt.Errorf("%w; if Apple sent a code, retry with --auth-code", err)
 					}
 
 					return err

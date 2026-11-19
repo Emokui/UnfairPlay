@@ -45,7 +45,9 @@ func (t *appstore) GetVersionMetadata(input GetVersionMetadataInput) (GetVersion
 		return GetVersionMetadataOutput{}, err
 	}
 
-	if res.Data.FailureType == FailureTypePasswordTokenExpired || res.Data.FailureType == FailureTypeSignInRequired {
+	if res.Data.FailureType == FailureTypePasswordTokenExpired ||
+		res.Data.FailureType == FailureTypeSignInRequired ||
+		res.Data.FailureType == FailureTypeDeviceVerificationFailed {
 		return GetVersionMetadataOutput{}, ErrPasswordTokenExpired
 	}
 
@@ -100,7 +102,7 @@ func (t *appstore) GetVersionMetadata(input GetVersionMetadataInput) (GetVersion
 	// Do not fall back to item.Metadata here. The App Store download API can
 	// return stale version and release date values, so the IPA Info.plist is the
 	// source of truth and failures should be visible to callers.
-	metadata, err := t.readVersionMetadataFromIPA(item.URL)
+	metadata, err := t.readVersionMetadataFromIPAContext(input.Context, item.URL)
 	if err != nil {
 		return GetVersionMetadataOutput{}, fmt.Errorf("failed to read version metadata: %w", err)
 	}

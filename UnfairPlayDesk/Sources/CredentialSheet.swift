@@ -49,14 +49,15 @@ struct CredentialSheet: View {
                 Spacer()
                 Button("取消", role: .cancel) { value = ""; cancel() }.keyboardShortcut(.cancelAction)
                 if activePrompt == .verificationChoice {
+                    Button("未收到验证码") { value = ""; submit("") }
                     Button("已收到验证码") { confirmedCode = true }
-                        .buttonStyle(DeskPrimaryButtonStyle(compact: true))
+                        .buttonStyle(DeskPrimaryButtonStyle(compact: true)).keyboardShortcut(.defaultAction)
                 } else {
                     Button(activePrompt == .verification ? "验证" : "继续", action: send)
                         .buttonStyle(DeskPrimaryButtonStyle(compact: true)).keyboardShortcut(.defaultAction).disabled(!valid)
                 }
             }
-        }.padding(24).frame(width: 360)
+        }.padding(24).frame(width: 380)
     }
 
     private var credentialField: some View {

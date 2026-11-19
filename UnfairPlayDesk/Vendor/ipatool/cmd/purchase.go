@@ -35,28 +35,29 @@ func purchaseCmdWithAppStore(appStore func() appstore.AppStore) *cobra.Command {
 				return err
 			}
 
+			store := appStore()
+			infoResult, err := store.AccountInfo()
+			if err != nil {
+				return err
+			}
+
+			acc := infoResult.Account
 			var lastErr error
-			var acc appstore.Account
+			refreshed := false
+			interactive := isInteractive(cmd.Context())
+			stage := newStageReporter()
 
 			return retry.Do(func() error {
-				store := appStore()
-				infoResult, err := store.AccountInfo()
-				if err != nil {
-					return err
-				}
-
-				acc = infoResult.Account
-
-				if errors.Is(lastErr, appstore.ErrPasswordTokenExpired) {
-					loginResult, err := store.Login(appstore.LoginInput{
-						Email:    acc.Email,
-						Password: acc.Password,
-					})
+				if appstore.IsSessionRefreshRequired(lastErr) {
+					refreshed = true
+					stage("正在更新 Apple 登录会话")
+					loginResult, err := refreshDownloadLogin(cmd.Context(), store, acc, interactive)
 					if err != nil {
-						return err
+						return wrapSessionRefreshError(lastErr, err)
 					}
 
 					acc = loginResult.Account
+					emitRefreshedSession(acc)
 				}
 
 				app := appstore.App{ID: appID}
@@ -83,10 +84,13 @@ func purchaseCmdWithAppStore(appStore func() appstore.AppStore) *cobra.Command {
 					return err
 				}
 
-				dependencies.Logger.Log().
+				event := dependencies.Logger.Log().
 					Bool("alreadyOwned", errors.Is(err, appstore.ErrLicenseAlreadyExists)).
-					Bool("success", true).
-					Send()
+					Bool("success", true)
+				if refreshed {
+					event = event.Str("email", acc.Email).Str("storeFront", acc.StoreFront)
+				}
+				event.Send()
 
 				return nil
 			},
@@ -97,7 +101,7 @@ func purchaseCmdWithAppStore(appStore func() appstore.AppStore) *cobra.Command {
 				retry.RetryIf(func(err error) bool {
 					lastErr = err
 
-					return errors.Is(err, appstore.ErrPasswordTokenExpired)
+					return !refreshed && appstore.IsSessionRefreshRequired(err)
 				}),
 			)
 		},

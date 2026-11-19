@@ -53,6 +53,41 @@ func TestCodeHookStopsEmulation(t *testing.T) {
 	}
 }
 
+func TestBlockHookChecksTheEntireBasicBlockBeforeExecution(t *testing.T) {
+	engine := newTestEngine(t)
+	defer engine.Close()
+	const address = uint64(0x2500000)
+	if err := engine.MemMap(address, 0x1000); err != nil {
+		t.Fatal(err)
+	}
+
+	// mov x0, #1; add x0, x0, #1; ret.
+	code := []byte{0x20, 0x00, 0x80, 0xd2, 0x00, 0x04, 0x00, 0x91, 0xc0, 0x03, 0x5f, 0xd6}
+	if err := engine.MemWrite(address, code); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotAddress uint64
+	var gotSize uint32
+	var stopErr error
+	hook, err := engine.AddBlockHook(func(current uint64, size uint32) {
+		gotAddress, gotSize = current, size
+		stopErr = engine.Stop()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hook.Close()
+
+	if err := engine.Start(address, address+uint64(len(code))); err != nil {
+		t.Fatal(err)
+	}
+	value, err := engine.RegRead(RegX0)
+	if err != nil || stopErr != nil || value != 0 || gotAddress != address || gotSize != uint32(len(code)) {
+		t.Fatalf("block callback: address=%#x size=%d x0=%d read=%v stop=%v", gotAddress, gotSize, value, err, stopErr)
+	}
+}
+
 func TestClosedCodeHookDoesNotRun(t *testing.T) {
 	engine := newTestEngine(t)
 	defer engine.Close()

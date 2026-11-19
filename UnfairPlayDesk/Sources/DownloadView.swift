@@ -25,7 +25,7 @@ extension ContentView {
                 if catalog.apps.isEmpty {
                     VStack(spacing: 10) {
                         DeskEmptyState(symbol: catalog.searched ? "magnifyingglass" : "square.grid.2x2", title: catalog.searched ? "没有找到应用" : "",
-                                       message: catalog.searched ? "换个名称或搜索地区再试试。" : "输入应用名称、App ID 或链接，\n无需登录即可浏览应用与版本记录。")
+                                       message: catalog.searched ? "换个名称或搜索地区再试试。" : "输入名称、Bundle ID、App ID 或链接，\n无需登录即可浏览应用与版本记录。")
                         if let id = Core.appID(catalogQuery) {
                             Button("直接使用 App ID \(id)") { openCatalogApp(id) }.buttonStyle(.borderless).padding(.bottom, 30)
                         }
@@ -49,7 +49,7 @@ extension ContentView {
     private var catalogSearchBar: some View {
         HStack(spacing: 8) {
             Image(systemName: "magnifyingglass").font(.system(size: 14, weight: .light)).foregroundStyle(.secondary)
-            TextField("搜索应用名称、ID 或链接", text: $catalogQuery)
+            TextField("名称、Bundle ID、ID 或链接", text: $catalogQuery)
                 .textFieldStyle(.plain).font(.system(size: 12)).onSubmit(searchApps)
                 .layoutPriority(1).accessibilityLabel("搜索应用")
             if !catalogQuery.isEmpty {
@@ -143,9 +143,13 @@ extension ContentView {
                                         .contentShape(Rectangle())
                                 }.buttonStyle(.plain).help("在 Finder 中显示：\(entry.url.path)")
                                     .contextMenu {
+                                        Button("去解密") { useDownloadedIPAForDecryption(entry.url) }
                                         Button("用于初始化模型") { useDownloadedIPAForSetup(entry.url) }
                                             .disabled(runner.busy || !store.canUseSelected)
                                     }
+                                Button { useDownloadedIPAForDecryption(entry.url) } label: {
+                                    Image(systemName: "lock.open").font(.system(size: 13)).frame(width: 26, height: 28)
+                                }.buttonStyle(.plain).foregroundStyle(DeskAppearance.accent).help("去解密").accessibilityLabel("去解密")
                                 Button { sendIPAWithAirDrop(entry.url) } label: {
                                     Image(systemName: "square.and.arrow.up").font(.system(size: 14))
                                         .foregroundStyle(DeskAppearance.accent).frame(width: 28, height: 28)
@@ -168,6 +172,13 @@ extension ContentView {
                     refreshIPAReferences()
                 }
             }
+    }
+    private func useDownloadedIPAForDecryption(_ url: URL) {
+        guard !Core.isMissingFile(url) else { refreshIPAReferences(); return }
+        showDownloads = false
+        inputIPAs = []
+        addInputIPAs([url])
+        page = .decrypt
     }
     private func sendIPAWithAirDrop(_ url: URL) {
         guard !Core.isMissingFile(url) else {
@@ -222,6 +233,7 @@ extension ContentView {
                 downloadedIPAs.removeAll { removed.contains($0.id) }
                 DownloadedIPA.save(downloadedIPAs)
                 refreshIPAReferences()
+                ipaFolderRevision += 1
                 if !failures.isEmpty {
                     let details = failures.prefix(4).joined(separator: "\n")
                     alertText = "\(failures.count) 个 IPA 未能移到废纸篓，记录已保留。\n\n" + details
@@ -272,9 +284,6 @@ extension ContentView {
         }.frame(width: size, height: size).clipShape(RoundedRectangle(cornerRadius: size * 0.22))
     }
     private func openCatalogApp(_ id: String) {
-        if catalog.purchaseStatus[id] == .unavailable || catalog.purchaseStatus[id] == .unowned {
-            catalog.purchaseStatus[id] = nil
-        }
         preventAppStoreUpdates = false
         appLink = id; catalog.selectApp(id); showAppDetails = true; showVersionEntry = false; loadVersions()
     }
@@ -286,21 +295,27 @@ extension ContentView {
                 catalogIcon(app, size: 54)
                 VStack(alignment: .leading, spacing: 8) {
                     Text(app?.name ?? "App ID \(id)").font(.system(size: 18, weight: .medium)).lineLimit(2)
-                    Text(app?.artist ?? app?.bundleID ?? "从 Apple 获取所选版本")
+                    Text(app?.artist ?? "从 Apple 获取所选版本")
                         .font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(1)
+                    if let bundleID = app?.bundleID {
+                        Button {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(bundleID, forType: .string)
+                        } label: {
+                            HStack(spacing: 5) {
+                                Text(bundleID).lineLimit(1).truncationMode(.middle)
+                                Image(systemName: "doc.on.doc").font(.system(size: 9))
+                            }
+                        }.buttonStyle(.plain).font(.system(size: 10)).foregroundStyle(.secondary)
+                            .help("复制 Bundle ID").accessibilityLabel("复制 Bundle ID \(bundleID)")
+                    }
                 }
                 Spacer(minLength: 0)
                 if let price = app?.priceText {
                     VStack(alignment: .trailing, spacing: 4) {
                         Text(price).font(.system(size: 13, weight: .medium)).monospacedDigit()
-                        if canDownload, catalog.purchaseStatus[id] == .unavailable {
-                            Button("重试购买状态检查") {
-                                catalog.purchaseStatus[id] = nil
-                                checkPaidApp(id)
-                            }.buttonStyle(.link).font(.caption).disabled(runner.busy)
-                        } else if !needsSelectedLogin {
-                            Text(catalog.purchaseStatus[id]?.text ?? (canDownload ? "待检查购买状态" : "登录后检查购买状态"))
-                                .font(.caption).foregroundStyle(.secondary)
+                        if let status = catalog.purchaseStatus[id] {
+                            Text(status.text).font(.caption).foregroundStyle(.secondary)
                         }
                     }
                 }
@@ -365,6 +380,8 @@ extension ContentView {
                 HStack(spacing: 16) {
                     Button(showVersionEntry ? "收起版本 ID" : "指定版本 ID") { showVersionEntry.toggle() }
                         .buttonStyle(.plain).font(.caption).foregroundStyle(.secondary)
+                    Toggle("直接保存", isOn: $saveIPAsDirectly).toggleStyle(.checkbox).font(.caption).controlSize(.small)
+                        .help("直接保存到默认下载文件夹，同名文件追加序号").disabled(runner.busy)
                     Toggle("不再更新", isOn: $preventAppStoreUpdates).toggleStyle(.checkbox)
                         .font(.caption).controlSize(.small)
                         .disabled(runner.busy || catalog.purchaseStatus[id] == .unowned)
@@ -397,32 +414,13 @@ extension ContentView {
         }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .task(id: "\(id):\(catalog.country):\(store.selected?.uuidString ?? "")") {
                 await catalog.lookUpAppName(id)
-                if !Task.isCancelled { checkPaidApp(id) }
             }
-            .onChange(of: canDownload) { checkPaidApp(id) }
-            .onChange(of: runner.busy) { if !runner.busy { checkPaidApp(id) } }
             .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
                 if purchasePageAppID == id {
                     purchasePageAppID = nil
                     catalog.purchaseStatus[id] = nil
-                    checkPaidApp(id)
                 }
             }
-    }
-    private func checkPaidApp(_ id: String) {
-        guard showAppDetails, Core.appID(appLink) == id, canDownload, !runner.busy,
-              catalog.purchaseStatus[id] == nil, catalog.app(for: id)?.priceText != nil,
-              let account = store.selected else { return }
-        catalog.purchaseStatus[id] = .checking
-        run("ipatool", ["download", "--app-id", id, "--check-license"], "正在检查购买状态") { ok in
-            struct LicenseResult: Decodable { let owned: Bool }
-            guard store.selected == account else { return }
-            guard ok, let result = try? DownloadCatalog.response(LicenseResult.self, in: runner.output) else {
-                catalog.purchaseStatus[id] = .unavailable
-                return
-            }
-            catalog.purchaseStatus[id] = result.owned ? .owned : .unowned
-        }
     }
     private func versionRow(version: String, identifier: String, date: String) -> some View {
         Button { catalog.selectedVersion = identifier } label: {
@@ -444,26 +442,10 @@ extension ContentView {
             return
         }
         catalog.updateAccountCountry(account.storeFront)
-        guard canDownload, account.storeFront == nil, page == .download, !runner.busy,
-              regionLookupAttempted.insert(account.id).inserted else { return }
-        operationAccount = account.name
-        runner.launch(tool("ipatool"), ["--profile", account.id.uuidString, "--format", "json", "auth", "info"], title: "正在读取账户地区") { ok in
-            guard ok else {
-                if !runner.cancelled && Core.isMissingSession(in: runner.output.lowercased()) {
-                    accountsNeedingLogin.insert(account.id)
-                }
-                return
-            }
-            do {
-                guard let email = Core.email(in: runner.output) else { throw DeskError("未能核对账户身份。") }
-                try store.bindIdentity(account.id, email: email, storeFront: Core.storeFront(in: runner.output) ?? "")
-            } catch { alertText = error.localizedDescription }
-        }
     }
     func resumeCatalog() {
-        if showAppDetails, let id = Core.appID(appLink) {
+        if showAppDetails, Core.appID(appLink) != nil {
             if !catalog.busy && catalog.error == nil && !catalog.versionsLoaded { loadVersions() }
-            checkPaidApp(id)
         } else if !catalog.busy && catalog.error == nil && !submittedCatalogQuery.isEmpty && !catalog.searched {
             catalog.search(submittedCatalogQuery)
         }
@@ -491,7 +473,19 @@ extension ContentView {
         let account = store.selected
         run("ipatool", ["get-version-metadata", "--app-id", id, "--external-version-id", version, "--platform", "iphone"], "正在读取所选版本信息") { ok in
             guard store.selected == account, showAppDetails, Core.appID(appLink) == id else { return }
-            guard ok else { catalog.metadataError = "版本信息暂不可用，仍可按版本 ID 尝试下载。"; return }
+            guard ok else {
+                guard !runner.cancelled else { return }
+                if runner.title == "账户身份校验未通过" {
+                    catalog.metadataError = alertText
+                    return
+                }
+                let lower = runner.output.lowercased()
+                let authOrKeychainFailure = (account.map(accountsNeedingLogin.contains) == true) ||
+                    lower.contains("read macos keychain item") || lower.contains("encrypted account session") ||
+                    lower.contains("account session key is") || lower.contains("keychain passphrase")
+                catalog.metadataError = authOrKeychainFailure ? Core.errorHint(runner.output) : "版本信息暂不可用，仍可按版本 ID 尝试下载。"
+                return
+            }
             do {
                 let detail = try DownloadCatalog.response(CatalogVersion.self, in: runner.output)
                 guard detail.externalVersionID == version else { throw DeskError("返回的版本 ID 不匹配。") }

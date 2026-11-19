@@ -106,10 +106,10 @@ var _ = Describe("AppStore (ZIP local metadata)", func() {
 		headers, err := newZIPLocalHeaders(bytes.NewReader(reordered), int64(len(reordered)))
 		Expect(err).ToNot(HaveOccurred())
 		for _, file := range reader.File {
-			extra, err := headers.extra(file)
+			entry, err := headers.entry(file)
 			Expect(err).ToNot(HaveOccurred())
 			if file.Name == "Payload/Test.app/_CodeSignature/CodeResources" {
-				Expect(extra).To(Equal(localTimestamp))
+				Expect(entry.extra).To(Equal(localTimestamp))
 			}
 		}
 	})
@@ -120,9 +120,9 @@ var _ = Describe("AppStore (ZIP local metadata)", func() {
 		Expect(err).ToNot(HaveOccurred())
 		headers, err := newZIPLocalHeaders(bytes.NewReader(out), int64(len(out)))
 		Expect(err).ToNot(HaveOccurred())
-		extra, err := headers.extra(reader.File[0])
+		entry, err := headers.entry(reader.File[0])
 		Expect(err).ToNot(HaveOccurred())
-		Expect(extra).To(Equal(localTimestamp))
+		Expect(entry.extra).To(Equal(localTimestamp))
 
 		By("rewriting the ZIP64 archive without retaining stale central offsets")
 		dir, err := os.MkdirTemp("", "ipatool-zip64-*")
@@ -163,7 +163,7 @@ var _ = Describe("AppStore (ZIP local metadata)", func() {
 		binary.LittleEndian.PutUint16(data[28:], 0xffff)
 		headers, err := newZIPLocalHeaders(bytes.NewReader(data), int64(len(data)))
 		Expect(err).ToNot(HaveOccurred())
-		_, err = headers.extra(reader.File[0])
+		_, err = headers.entry(reader.File[0])
 		Expect(err).To(HaveOccurred())
 	})
 })

@@ -4,11 +4,11 @@
 <h1 align="center">UnfairPlay</h1>
 <p align="center">在 Mac 上查找 App Store 应用、下载历史版本，以及在本机解密和验证 IPA。</p>
 <p align="center">
-  <strong>1.5.7</strong> · Apple 芯片 Mac · 最低部署目标 macOS 14.0
+  <strong>1.5.8</strong> · Apple 芯片 Mac · 最低部署目标 macOS 14.0
 </p>
 <p align="center">
-  <a href="https://github.com/Emokui/UnfairPlay/releases/download/v1.5.7/UnfairPlay-1.5.7.dmg"><strong>下载 DMG</strong></a>
-  · <a href="https://github.com/Emokui/UnfairPlay/releases/tag/v1.5.7">更新说明</a>
+  <a href="https://github.com/Emokui/UnfairPlay/releases/latest"><strong>下载最新已发布版本</strong></a>
+  · <a href="UnfairPlayDesk/CHANGELOG.md#158">更新说明</a>
   · <a href="#从源码构建">从源码构建</a>
 </p>
 
@@ -31,7 +31,7 @@
 
 ## 安装与使用
 
-1. 打开 [DMG 安装包](https://github.com/Emokui/UnfairPlay/releases/download/v1.5.7/UnfairPlay-1.5.7.dmg)，将 **UnfairPlay.app** 拖入 **Applications**。
+1. 从 [GitHub Releases](https://github.com/Emokui/UnfairPlay/releases/latest) 下载并打开 DMG，将 **UnfairPlay.app** 拖入 **Applications**。
 2. 在「账户与模型」添加 Apple 账户。搜索无需登录，下载使用当前账户的 App Store 许可。
 3. 处理本机 IPA 前，在对应账户中导入或初始化模型。模型通过校验后，进入「解密与验证」选择文件。
 
@@ -39,7 +39,7 @@
 
 ## 从源码构建
 
-需要 Apple 芯片 Mac、Xcode Command Line Tools 和 Go 1.26.5 或更新版本。下载源码或克隆仓库后，在仓库根目录运行：
+需要 Apple 芯片 Mac、Xcode Command Line Tools、Python 3 和 Go 1.26.5 或更新版本。下载源码或克隆仓库后，在仓库根目录运行：
 
 ```sh
 cd UnfairPlayDesk

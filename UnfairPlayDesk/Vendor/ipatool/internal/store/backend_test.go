@@ -28,6 +28,9 @@ var _ = Describe("Store connection reuse", func() {
 			w.Header().Set("X-Connection", r.RemoteAddr)
 			w.Header().Set("X-Received-Cookie", r.Header.Get("Cookie"))
 			switch r.URL.Path {
+			case "/bag":
+				_, _ = io.WriteString(w, `<?xml version="1.0"?><plist version="1.0"><dict><key>urlBag</key><dict><key>buyProduct</key><string>fixture</string></dict></dict></plist>`)
+				return
 			case "/cookie":
 				http.SetCookie(w, &http.Cookie{Name: "session", Value: "fixture", Path: "/"})
 			case "/redirect":
@@ -83,6 +86,62 @@ var _ = Describe("Store connection reuse", func() {
 		Expect(second.Header.Get("X-Connection")).NotTo(Equal(first.Header.Get("X-Connection")))
 		Expect(get("request", "/").Header.Get("X-Connection")).To(Equal(api.Header.Get("X-Connection")))
 	})
+	It("reuses the HTTP pool for direct bag and SAP calls but omits account cookies for the catalog", func() {
+		original := get("request", "/cookie")
+		bag := apphttp.NewClient[[]byte](apphttp.Args{Executor: backend.Client("bag-direct")})
+		reply, err := bag.Send(apphttp.Request{Method: http.MethodGet, URL: server.URL, ResponseFormat: apphttp.ResponseFormatRaw})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(reply.Headers["X-Connection"]).To(Equal(original.Header.Get("X-Connection")))
+
+		req, err := http.NewRequest(http.MethodGet, server.URL, nil)
+		Expect(err).NotTo(HaveOccurred())
+		sap, err := backend.Client("sap").Do(req)
+		Expect(err).NotTo(HaveOccurred())
+		_, err = io.Copy(io.Discard, sap.Body)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(sap.Body.Close()).To(Succeed())
+		Expect(sap.Header.Get("X-Connection")).To(Equal(original.Header.Get("X-Connection")))
+
+		catalog := apphttp.NewClient[[]byte](apphttp.Args{Executor: backend.Client("catalog")})
+		reply, err = catalog.Send(apphttp.Request{Method: http.MethodGet, URL: server.URL + "/redirect", ResponseFormat: apphttp.ResponseFormatRaw})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(reply.StatusCode).To(Equal(http.StatusOK))
+		Expect(reply.Headers["X-Received-Cookie"]).To(BeEmpty())
+	})
+
+	It("retains a direct bag for its hardware GUID while preserving the response", func() {
+		requests := 0
+		bagServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests++
+			_, _ = io.WriteString(w, `<?xml version="1.0"?><plist version="1.0"><dict><key>urlBag</key><dict><key>buyProduct</key><string>fixture</string></dict></dict></plist>`)
+		}))
+		defer bagServer.Close()
+
+		bag := apphttp.NewClient[[]byte](apphttp.Args{Executor: backend.Client("bag-direct")})
+		response, err := bag.Send(apphttp.Request{Method: http.MethodGet, URL: bagServer.URL + "/bag?guid=001122aabbcc", ResponseFormat: apphttp.ResponseFormatRaw})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(response.Data)).To(ContainSubstring("buyProduct"))
+		Expect(requests).To(Equal(1))
+
+		reused, err := bag.Send(apphttp.Request{Method: http.MethodGet, URL: bagServer.URL + "/bag?guid=001122aabbcc", ResponseFormat: apphttp.ResponseFormatRaw})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(reused.Data).To(Equal(response.Data))
+		Expect(requests).To(Equal(1))
+
+		Expect(backend.cachedBag("001122AABBCC")).To(HaveKey("urlBag"))
+		Expect(backend.cachedBag("221122AABBCC")).To(BeNil())
+
+		_, err = bag.Send(apphttp.Request{Method: http.MethodGet, URL: bagServer.URL + "/bag?guid=221122aabbcc", ResponseFormat: apphttp.ResponseFormatRaw})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(requests).To(Equal(2))
+
+		backend.ClearBag()
+		Expect(backend.cachedBag("221122AABBCC")).To(BeNil())
+		_, err = bag.Send(apphttp.Request{Method: http.MethodGet, URL: bagServer.URL + "/bag?guid=221122aabbcc", ResponseFormat: apphttp.ResponseFormatRaw})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(requests).To(Equal(3))
+	})
+
 	It("returns redirects to the framework", func() {
 		Expect(get("request", "/redirect").StatusCode).To(Equal(http.StatusFound))
 	})

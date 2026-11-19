@@ -18,7 +18,10 @@ func IPAHasEncryptedImages(path string) (bool, error) {
 		return false, err
 	}
 	defer archive.Close()
+	return ipaHasEncryptedImages(archive)
+}
 
+func ipaHasEncryptedImages(archive *zip.ReadCloser) (bool, error) {
 	found := false
 	var incomplete error
 	for _, file := range archive.File {

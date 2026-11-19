@@ -38,7 +38,11 @@ final class Runner: ObservableObject {
     @Published var progress: Double?
     @Published var currentLine = ""
     var output = ""
+    private var diagnostic: TaskDiagnostic?
+    private var diagnosticSecrets: [String] = []
+    private var diagnosticPhase = ""
     var process: Process?
+    private var sessionKeyChannel: SessionKeyChannel?
     var master: Int32 = -1
     var outputHandle: FileHandle?
     var finished: ((Bool) -> Void)?
@@ -46,6 +50,7 @@ final class Runner: ObservableObject {
     var privileged = false
     var saving = false
     private var holdsCompletion = false
+    private var batchID: UUID?
     var background = false
     var pendingBytes = Data()
     private var pendingCR = false
@@ -61,9 +66,17 @@ final class Runner: ObservableObject {
         return Bundle.main.resourceURL!.appendingPathComponent("Tools/worker")
         #endif
     }
-    func launch(_ url: URL, _ args: [String], title: String, privileged: Bool = false, holdsCompletion: Bool = false, done: ((Bool)->Void)? = nil) {
-        guard !busy else { return }
+    func launch(_ url: URL, _ args: [String], title: String, privileged: Bool = false, holdsCompletion: Bool = false, sessionAccount: UUID? = nil, batchID: UUID? = nil, done: ((Bool)->Void)? = nil) {
+        if let batchID {
+            guard self.batchID == batchID, !saving, process == nil, !cancelled else { done?(false); return }
+        } else {
+            guard !busy else { return }
+        }
         generation = UUID()
+        diagnostic = TaskDiagnostic(title: title, tool: url.lastPathComponent)
+        diagnosticSecrets = []
+        diagnosticPhase = ""
+        diagnostic?.stage("校验应用组件")
         let token = generation
         self.title = title; hint = nil; log = ""; output = ""; currentLine = ""; progress = nil; progressBuffer = ""; pendingBytes = Data(); pendingCR = false; submittedPromptLine = nil
         finished = done; self.privileged = privileged; self.holdsCompletion = holdsCompletion && done != nil; cancelled = false
@@ -74,14 +87,21 @@ final class Runner: ObservableObject {
             if cancelled {
                 updateCompletionState()
                 self.title = "操作已取消"
+                diagnostic?.finish("已取消")
                 let callback = finished; finished = nil; callback?(false); return
             }
-            startProcess(url, args, token: token)
+            startProcess(url, args, token: token, sessionAccount: sessionAccount)
         }
     }
-    private func startProcess(_ url: URL, _ args: [String], token: UUID) {
+    private func startProcess(_ url: URL, _ args: [String], token: UUID, sessionAccount: UUID?) {
+        diagnostic?.stage("启动任务")
         let task = Process(); task.executableURL = worker
-        task.arguments = ["--parent", String(getpid()), url.path] + args
+        let channel: SessionKeyChannel?
+        do { channel = try sessionAccount.map { _ in try SessionKeyChannel() } }
+        catch { failLaunch(error.localizedDescription); return }
+        let channelOption = channel == nil ? [] : ["--session-channel"]
+        let toolOptions = channel == nil ? [] : ["--desk-session-fd", "3"]
+        task.arguments = ["--parent", String(getpid())] + channelOption + [url.path] + toolOptions + args
         var environment = ProcessInfo.processInfo.environment
         environment["TERM"] = "dumb"; environment["NO_COLOR"] = "1"
         task.environment = environment
@@ -96,7 +116,7 @@ final class Runner: ObservableObject {
         let slave = FileHandle(fileDescriptor: secondary, closeOnDealloc: true)
         let reader = FileHandle(fileDescriptor: primary, closeOnDealloc: true)
         master = primary; outputHandle = reader
-        task.standardInput = slave; task.standardOutput = slave; task.standardError = slave
+        task.standardInput = channel?.child ?? slave; task.standardOutput = slave; task.standardError = slave
         reader.readabilityHandler = { [weak self] handle in
             var bytes = [UInt8](repeating: 0, count: 8192)
             let count = read(primary, &bytes, bytes.count)
@@ -106,6 +126,7 @@ final class Runner: ObservableObject {
             } else if count == 0 || errno == EIO { handle.readabilityHandler = nil }
         }
         task.terminationHandler = { [weak self] process in
+            channel?.cancel()
             reader.readabilityHandler = nil
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                 guard let self else { return }
@@ -118,9 +139,11 @@ final class Runner: ObservableObject {
                 }
                 if !self.pendingBytes.isEmpty { self.append(String(decoding: self.pendingBytes, as: UTF8.self)); self.pendingBytes = Data() }
                 let ok = process.terminationStatus == 0 && !self.cancelled
+                self.diagnostic?.finish(self.cancelled ? "已取消" : ok ? "成功" : "失败",
+                                        exitStatus: process.terminationStatus, signalled: process.terminationReason == .uncaughtSignal)
                 self.updateCompletionState()
                 self.inputPrompt = nil; self.master = -1
-                self.outputHandle = nil; self.process = nil
+                self.outputHandle = nil; self.process = nil; self.sessionKeyChannel = nil
                 self.title = self.cancelled ? "操作已取消" : ok ? "操作完成" : "操作失败"
                 self.hint = ok || self.cancelled ? nil : Core.errorHint(self.output)
                 if ok { self.progress = 1 }
@@ -130,6 +153,10 @@ final class Runner: ObservableObject {
         }
         do {
             try task.run(); try? slave.close()
+            sessionKeyChannel = channel
+            if let channel, let sessionAccount {
+                channel.serve(account: sessionAccount, deleting: args.contains("revoke"))
+            }
             process = task; busy = true; inputPrompt = nil; Runner.active[id] = self
         } catch {
             reader.readabilityHandler = nil; try? slave.close(); try? reader.close()
@@ -137,14 +164,15 @@ final class Runner: ObservableObject {
         }
     }
     func failLaunch(_ reason: String) {
+        diagnostic?.finish("启动失败")
         log = reason; title = "启动失败"; hint = reason; inputPrompt = nil
         updateCompletionState()
         let callback = finished; finished = nil; callback?(false)
     }
     private func updateCompletionState() {
         saving = holdsCompletion
-        busy = holdsCompletion
-        if !holdsCompletion { Runner.active.removeValue(forKey: id) }
+        busy = holdsCompletion || batchID != nil
+        if !busy { Runner.active.removeValue(forKey: id) }
     }
     func receive(_ data: Data) {
         pendingBytes.append(data)
@@ -170,6 +198,10 @@ final class Runner: ObservableObject {
                let message = json["message"] as? String,
                json["phase"] != nil || message.hasPrefix("正在") || message.hasPrefix("首次准备：") || message.hasPrefix("已提取认证组件") || message == "已复用认证组件缓存" || message == "认证组件准备完成，正在验证 Apple 账户" {
                 title = message
+                if let phase = json["phase"] as? String {
+                    if phase == "stage" || phase != diagnosticPhase { diagnostic?.stage(message) }
+                    diagnosticPhase = phase
+                } else { diagnostic?.stage(message) }
                 if let phase = json["phase"] as? String {
                     structuredProgress = true
                     if let done = json["completed"] as? Double, let total = json["total"] as? Double, total > 0 {
@@ -207,28 +239,62 @@ final class Runner: ObservableObject {
     }
     func reply(_ value: String) {
         guard canReply, master >= 0 else { return }
+        let prompt = inputPrompt
+        if prompt != .account, !value.isEmpty { diagnosticSecrets.append(value) }
         let data = Data((value + "\n").utf8)
         let written = data.withUnsafeBytes { write(master, $0.baseAddress, $0.count) }
         guard written == data.count else { stop(); return }
         submittedPromptLine = currentLine
         inputPrompt = nil
-        title = "正在处理…"
+        switch prompt {
+        case .verification, .verificationChoice: recordStage("正在提交 Apple 验证信息")
+        case .password: recordStage("正在验证 Apple 账户")
+        case .account: recordStage("正在提交 Apple ID")
+        case .passphrase: recordStage("正在解锁凭据库")
+        case nil: break
+        }
     }
     @MainActor func fileWork<T>(_ title: String, operation: @escaping () throws -> T) async -> Result<T, Error> {
+        if !busy {
+            diagnostic = TaskDiagnostic(title: title, tool: "文件操作")
+            diagnosticSecrets = []
+            output = ""; log = ""
+        }
+        diagnostic?.stage(title)
         busy = true; saving = true; inputPrompt = nil; self.title = title; progress = nil; hint = nil
         Runner.active[id] = self
         let result = await Task.detached(priority: .userInitiated) { Result { try operation() } }.value
         updateCompletionState()
         switch result {
-        case .success: self.title = "操作完成"
-        case .failure: self.title = "操作失败"
+        case .success: self.title = "操作完成"; diagnostic?.finish("成功")
+        case .failure: self.title = "操作失败"; diagnostic?.finish("失败")
         }
         return result
     }
+    @MainActor func beginBatch(_ title: String) -> UUID? {
+        guard !busy else { return nil }
+        let token = UUID()
+        batchID = token
+        self.title = title
+        diagnostic = nil
+        diagnosticSecrets = []
+        diagnosticPhase = ""
+        output = ""; log = ""; currentLine = ""
+        cancelled = false; privileged = false; saving = false; inputPrompt = nil; progress = nil; hint = nil
+        busy = true
+        Runner.active[id] = self
+        return token
+    }
+    @MainActor func finishBatch(_ token: UUID) {
+        guard batchID == token, process == nil else { return }
+        batchID = nil
+        holdsCompletion = false
+        updateCompletionState()
+    }
     @MainActor func finishCompletion() {
         guard holdsCompletion else { return }
-        holdsCompletion = false; saving = false; busy = false
-        Runner.active.removeValue(forKey: id)
+        holdsCompletion = false
+        updateCompletionState()
     }
     @MainActor func saveFile(_ operation: @escaping () throws -> Void) async -> Result<Void, Error> {
         let started = Date()
@@ -240,8 +306,19 @@ final class Runner: ObservableObject {
         }
         return result
     }
+    func recordStage(_ title: String) {
+        self.title = title
+        progress = nil
+        diagnostic?.stage(title)
+    }
+    func diagnosticReport(detail: String) -> String {
+        var record = diagnostic ?? TaskDiagnostic(title: "应用操作", tool: "UnfairPlay")
+        if diagnostic == nil { record.finish("应用提示") }
+        return record.report(detail: detail, output: output.isEmpty ? log : output, secrets: diagnosticSecrets)
+    }
     func stop() {
         guard !privileged && !saving else { return }
         cancelled = true; inputPrompt = nil; process?.terminate()
+        sessionKeyChannel?.cancel()
     }
 }

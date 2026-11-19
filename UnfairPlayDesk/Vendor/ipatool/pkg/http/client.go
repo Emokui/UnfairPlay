@@ -205,6 +205,15 @@ func (c *client[R]) handleXMLResponse(res *http.Response) (Result[R], error) {
 		return Result[R]{}, fmt.Errorf("failed to read response body: %w", &TransportError{Err: err, RetryAfter: res.Header.Get("Retry-After")})
 	}
 
+	// These Store provisioning challenges are carried in headers and may
+	// have no plist body. Unrecognized responses use the normal validation.
+	if c.authentication {
+		switch strings.TrimSpace(res.Header.Get("X-Apple-AMD-Action")) {
+		case "RP", "SP":
+			return Result[R]{StatusCode: res.StatusCode, Headers: responseHeaders(res)}, nil
+		}
+	}
+
 	if c.authentication && IsAuthenticationRedirect(res.StatusCode) && strings.TrimSpace(res.Header.Get("Location")) == "" {
 		return Result[R]{}, authenticationResponseError(res, body, "authentication redirect is missing Location")
 	}

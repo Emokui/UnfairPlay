@@ -12,7 +12,7 @@ struct DeskError: LocalizedError {
 enum Core {
     // Share one background check across foreground tools and model diagnostics.
     static let bundleVerification = Task.detached(priority: .userInitiated) { try verifyBundle() }
-    struct FileStamp: Equatable {
+    struct FileStamp: Equatable, Codable {
         let device: dev_t, inode: ino_t, size: off_t, mode: mode_t
         let modifiedSeconds: Int, modifiedNanos: Int, changedSeconds: Int, changedNanos: Int
     }
@@ -244,9 +244,20 @@ enum Core {
         for line in output.components(separatedBy: .newlines).reversed() {
             guard let start = line.firstIndex(of: "{"), let data = String(line[start...]).data(using: .utf8),
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  json["success"] as? Bool == true, json["email"] is String,
+                  json["success"] as? Bool == true || json["sessionRefreshed"] as? Bool == true, json["email"] is String,
                   let value = json["storeFront"] as? String else { continue }
             return value
+        }
+        return nil
+    }
+    static func refreshedSession(in output: String) -> (email: String, storeFront: String?)? {
+        for line in output.components(separatedBy: .newlines).reversed() {
+            guard let start = line.firstIndex(of: "{"), let data = String(line[start...]).data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  json["sessionRefreshed"] as? Bool == true,
+                  let email = (json["email"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+                  !email.isEmpty else { continue }
+            return (email, json["storeFront"] as? String)
         }
         return nil
     }
@@ -267,17 +278,23 @@ enum Core {
     }
     static func errorHint(_ text: String) -> String {
         let value = text.lowercased()
+        if value.contains("read macos keychain item") { return "钥匙串读取未获授权，请在系统弹窗中允许访问后重试。" }
+        if value.contains("encrypted account session") || value.contains("account session key is") {
+            return "此账户的加密会话或密钥不可用，请在账户菜单清除此账户登陆，再重新登录。"
+        }
+        if value.contains("account session was cleared") { return "此账户的登录信息已清除，请重新登录。" }
         if value.contains("free app license rejected after sign-in refresh") { return "Apple 在重新验证后仍未发放免费许可。请先用同一个 Apple ID 在 App Store 点「获取」，再回来下载。" }
         if value.contains("unsupported") && (value.contains("build") || value.contains("fairplay")) { return "当前系统构建暂未受内置工具支持，请升级工具后再初始化；不要放宽校验或强行生成模型。" }
         if value.contains("license is required") { return "当前 ID 尚未取得此应用许可。若自动获取未成功，请用此 ID 在 App Store 获取或购买应用后重试，无需清除登录。" }
         if value.contains("deadline exceeded") || value.contains("client.timeout") || value.contains("i/o timeout") { return "Apple 接口响应超时，请重试。" }
         if value.contains("download received no data") { return "下载连接长时间没有收到数据，续传仍未成功，请重试。" }
-        if value.contains("download account does not match") { return "下载会话与所选账户不一致，请在账户操作菜单重新登录。" }
+        if value.contains("download account does not match") || value.contains("account does not match selected profile") { return "下载会话与所选账户不一致，请在账户操作菜单重新登录。" }
         if value.contains("incorrect apple account or password") { return "Apple 拒绝了账号或密码，请核对后重试。" }
         if value.contains("apple did not confirm sign-in") { return "请核对 Apple 账户和密码。收到本次登录的验证码后，可以选择继续验证。" }
         if value.contains("apple did not accept the password and verification code") { return "请核对密码和本次登录的六位验证码，再重新登录。" }
         if value.contains("auth code is required") { return "Apple 要求重新验证，请在账户操作菜单选择继续登录。" }
-        if value.contains("password token") || value.contains("token expired") || value.contains("session expired") { return "登录会话已过期，请在账户操作菜单选择继续登录。" }
+        if value.contains("store amd state is not provisioned") || value.contains("returned no store amd proof") { return "当前账户缺少商店设备认证信息，请在账户操作菜单选择继续登录。" }
+        if value.contains("password token") || value.contains("token expired") || value.contains("session expired") || value.contains("failed to refresh apple login") { return "登录会话已过期，请在账户操作菜单选择继续登录。" }
         if isMissingSession(in: value) { return "这个账户档案尚未登录，请先登录此 ID。" }
         if value.contains("keychain passphrase") { return "需要解锁此账户的加密凭据库。请按提示输入解锁口令，它与 Apple ID 密码不同。" }
         if value.contains("authcode") || value.contains("2fa") || value.contains("verification") { return "需要验证 Apple 账户，请按提示输入验证码；若操作已结束，请重新登录。" }

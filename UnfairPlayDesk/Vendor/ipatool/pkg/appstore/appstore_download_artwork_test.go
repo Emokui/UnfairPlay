@@ -3,7 +3,9 @@ package appstore
 import (
 	"archive/zip"
 	"context"
+	"errors"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/majd/ipatool/v2/pkg/util/operatingsystem"
+	"howett.net/plist"
 )
 
 func TestDownloadArtworkAndIncludeInIPA(t *testing.T) {
@@ -107,5 +110,120 @@ func TestDownloadArtworkRejectsFailedResponse(t *testing.T) {
 
 	if data, err := store.downloadArtwork(context.Background(), ""); err != nil || len(data) != 0 {
 		t.Fatal("missing artwork URL should be skipped")
+	}
+}
+
+func TestFinalizationPreservesIPAWhenOptionalArtworkFails(t *testing.T) {
+	for _, rewriteFails := range []bool{false, true} {
+		name := "optional artwork"
+		if rewriteFails {
+			name = "failed archive rewrite"
+		}
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			tmpPath := filepath.Join(root, "output.ipa.tmp")
+			file, err := os.Create(tmpPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			writer := zip.NewWriter(file)
+			image, err := writer.Create("iTunesArtwork")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = io.WriteString(image, "existing artwork"); err != nil {
+				t.Fatal(err)
+			}
+			if err = writer.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err = file.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			artworkReady := make(chan artworkResult, 1)
+			artworkReady <- artworkResult{err: context.DeadlineExceeded}
+			target := filepath.Join(root, "output.ipa")
+			if rewriteFails {
+				target = filepath.Join(root, "missing-folder", "output.ipa")
+			}
+			store := &appstore{os: operatingsystem.New()}
+			err = store.finishDownloadedIPA(DownloadInput{}, downloadItemResult{}, "", tmpPath, target, artworkReady)
+			if (err != nil) != rewriteFails {
+				t.Fatalf("unexpected finalization result: %v", err)
+			}
+			if _, err := os.Stat(tmpPath); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("temporary package was not removed: %v", err)
+			}
+			if rewriteFails {
+				return
+			}
+			archive, err := zip.OpenReader(target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer archive.Close()
+			data, err := fs.ReadFile(archive, "iTunesArtwork")
+			if err != nil || string(data) != "existing artwork" {
+				t.Fatalf("original artwork was lost: %q, %v", data, err)
+			}
+		})
+	}
+}
+
+func TestWriteMetadataClonesCallerMapAndHandlesNil(t *testing.T) {
+	store := &appstore{}
+	account := Account{Email: "user@example.invalid"}
+
+	for _, test := range []struct {
+		name     string
+		metadata map[string]interface{}
+	}{
+		{name: "nil metadata", metadata: nil},
+		{name: "caller metadata", metadata: map[string]interface{}{"apple-id": "original@example.invalid", "bundleShortVersionString": "1.2.3"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "metadata.zip")
+			file, err := os.Create(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			writer := zip.NewWriter(file)
+			if err := store.writeMetadata(test.metadata, account, writer); err != nil {
+				t.Fatal(err)
+			}
+			if err := writer.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := file.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			if test.metadata != nil && test.metadata["apple-id"] != "original@example.invalid" {
+				t.Fatalf("caller metadata map was mutated: %v", test.metadata)
+			}
+			if test.metadata != nil {
+				if _, exists := test.metadata["userName"]; exists {
+					t.Fatalf("caller metadata map gained userName: %v", test.metadata)
+				}
+			}
+
+			archive, err := zip.OpenReader(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer archive.Close()
+			raw, err := fs.ReadFile(archive, "iTunesMetadata.plist")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var decoded map[string]interface{}
+			if _, err := plist.Unmarshal(raw, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			if decoded["apple-id"] != account.Email || decoded["userName"] != account.Email {
+				t.Fatalf("unexpected written metadata: %v", decoded)
+			}
+		})
 	}
 }

@@ -613,7 +613,7 @@ var _ = Describe("AppStore (Download)", func() {
 
 		BeforeEach(func() {
 			var err error
-			testFile, err = os.CreateTemp("", "test_file")
+			testFile, err = os.CreateTemp("", "test_file*.tmp")
 			Expect(err).ToNot(HaveOccurred())
 
 			mockMachine.EXPECT().
@@ -663,20 +663,25 @@ var _ = Describe("AppStore (Download)", func() {
 
 		AfterEach(func() {
 			err := os.Remove(testFile.Name())
-			Expect(err).ToNot(HaveOccurred())
+			if !os.IsNotExist(err) {
+				Expect(err).ToNot(HaveOccurred())
+			}
 		})
 
-		It("writes data to file", func() {
-			mockOS.EXPECT().
-				Getwd().
-				Return("", nil)
+		It("writes the response and removes it when it is not a ZIP", func() {
+			tmpPath := testFile.Name()
+			mockOS.EXPECT().Stat(tmpPath).Return(&dummyFileInfo{}, nil)
+			mockOS.EXPECT().Remove(tmpPath).DoAndReturn(func(path string) error {
+				testData, err := os.ReadFile(path)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(string(testData)).To(Equal("ping"))
+				return os.Remove(path)
+			})
 
-			_, err := as.Download(DownloadInput{})
-			Expect(err).To(HaveOccurred())
-
-			testData, err := os.ReadFile(testFile.Name())
-			Expect(err).ToNot(HaveOccurred())
-			Expect(string(testData)).To(Equal("ping"))
+			_, err := as.Download(DownloadInput{OutputPath: strings.TrimSuffix(tmpPath, ".tmp")})
+			Expect(err).To(MatchError(ContainSubstring("failed to validate package platform")))
+			_, err = os.Stat(tmpPath)
+			Expect(os.IsNotExist(err)).To(BeTrue())
 		})
 
 		When("successfully applies patches", func() {

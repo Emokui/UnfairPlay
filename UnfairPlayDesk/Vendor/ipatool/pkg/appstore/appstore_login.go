@@ -112,6 +112,7 @@ func (t *appstore) loginWithContext(ctx context.Context, input LoginInput, authC
 		return LoginOutput{}, errors.New("SAP action signer is not configured")
 	}
 
+	t.reportAuthenticationStage("正在准备 Apple 认证签名")
 	signer, err := t.actionSignerFactory(ctx, bag.SAPConfig, machineID)
 	if err != nil {
 		return LoginOutput{}, fmt.Errorf("failed to initialize SAP action signer: %w", err)
@@ -221,6 +222,14 @@ func (t *appstore) loginContext(ctx context.Context, email, password, authCode, 
 		if err := ctx.Err(); err != nil {
 			return Account{}, err
 		}
+		switch {
+		case redirects > 0:
+			t.reportAuthenticationStage(fmt.Sprintf("正在连接 Apple 认证节点（跳转 %d）", redirects))
+		case authCode != "":
+			t.reportAuthenticationStage("正在验证 Apple 双重认证验证码")
+		default:
+			t.reportAuthenticationStage("正在验证 Apple 账户")
+		}
 		request.Context = ctx
 		res, err = t.sendAuthenticationRequest(request)
 
@@ -329,6 +338,9 @@ func (t *appstore) sendAuthenticationRequest(request http.Request) (http.Result[
 		if err := ctx.Err(); err != nil {
 			return http.Result[loginResult]{}, err
 		}
+		if attempt > 1 {
+			t.reportAuthenticationStage(fmt.Sprintf("正在重试 Apple 认证请求（第 %d 次）", attempt))
+		}
 		result, err := t.loginClient.Send(request)
 		if ctx.Err() != nil {
 			return result, ctx.Err()
@@ -392,6 +404,7 @@ func (t *appstore) sendAuthenticationRequest(request http.Request) (http.Result[
 			delay = max(requested, time.Second)
 		}
 
+		t.reportAuthenticationStage(fmt.Sprintf("Apple 认证请求暂未完成，%g 秒后重试", delay.Seconds()))
 		if t.authRetrySleep != nil {
 			t.authRetrySleep(delay)
 			continue

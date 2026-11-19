@@ -2,9 +2,12 @@ package machimage
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"io"
+	"maps"
+	"sync"
 )
 
 // OpenShared borrows immutable image bytes and copies only pages changed by
@@ -17,6 +20,21 @@ func OpenShared(name string, input []byte) (*Image, error) {
 	}
 
 	return openImage(name, data, make(map[uint64][]byte))
+}
+
+// OpenSharedVerified opens an immutable image whose SHA-256 digest has already
+// been verified by the caller. Universal binaries still hash the selected slice.
+func OpenSharedVerified(name string, input []byte, digest [sha256.Size]byte) (*Image, error) {
+	data, err := ARM64Slice(input)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", name, err)
+	}
+
+	if len(data) != len(input) {
+		digest = sha256.Sum256(data)
+	}
+
+	return openImageWithDigest(name, data, make(map[uint64][]byte), digest, true)
 }
 
 func (i *Image) writeAt(offset uint64, data []byte) {
@@ -119,9 +137,15 @@ func (i *Image) writeSegment(memory Memory, address, start, end uint64, buffer [
 
 	for position := start; position < end; {
 		stop := min(position+uint64(len(buffer)), end)
-		data := buffer[:stop-position]
-		copy(data, i.data[position:stop])
-		i.overlay(data, position)
+		data := i.data[position:stop]
+		for page := position &^ (pageSize - 1); page < stop; page += pageSize {
+			if i.modified[page] != nil || len(i.instructions[page]) != 0 {
+				data = buffer[:stop-position]
+				copy(data, i.data[position:stop])
+				i.overlay(data, position)
+				break
+			}
+		}
 
 		if err := memory.MemWrite(address+position-start, data); err != nil {
 			return fmt.Errorf("write image chunk: %w", err)
@@ -156,4 +180,53 @@ func (r imageInput) ReadAt(data []byte, offset int64) (int, error) {
 	}
 
 	return count, nil
+}
+
+// Cache only pointer locations. The resolved guest addresses and resulting
+// relocations stay private to each VM because shims can use different addresses.
+type prelinkedFixup struct {
+	offset, original uint64
+}
+
+var sharedPrelink struct {
+	sync.Mutex
+	digest  [sha256.Size]byte
+	symbols map[uint64]string
+	fixups  []prelinkedFixup
+}
+
+func (i *Image) prelinkedFixups(external map[uint64]string) []prelinkedFixup {
+	if i.modified == nil || len(i.modified) != 0 {
+		return i.scanPrelinkedFixups(external)
+	}
+
+	sharedPrelink.Lock()
+	defer sharedPrelink.Unlock()
+	if sharedPrelink.digest != i.sharedDigest || !maps.Equal(sharedPrelink.symbols, external) {
+		sharedPrelink.fixups = i.scanPrelinkedFixups(external)
+		sharedPrelink.digest = i.sharedDigest
+		sharedPrelink.symbols = maps.Clone(external)
+	}
+	return sharedPrelink.fixups
+}
+
+func (i *Image) scanPrelinkedFixups(external map[uint64]string) []prelinkedFixup {
+	var fixups []prelinkedFixup
+	for _, item := range i.segments {
+		if item.name == "__TEXT" || item.name == "__LINKEDIT" || item.fileSize < pointerSize {
+			continue
+		}
+		start := item.fileOff
+		if remainder := item.address % pointerSize; remainder != 0 {
+			start += pointerSize - remainder
+		}
+		end := item.fileOff + item.fileSize
+		for offset := start; offset <= end-pointerSize; offset += pointerSize {
+			current := i.pointerAt(offset)
+			if _, ok := external[current]; ok {
+				fixups = append(fixups, prelinkedFixup{offset: offset, original: current})
+			}
+		}
+	}
+	return fixups
 }

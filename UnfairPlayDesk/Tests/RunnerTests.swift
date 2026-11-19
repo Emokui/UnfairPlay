@@ -38,9 +38,113 @@ import Darwin
         let root = fm.temporaryDirectory.appendingPathComponent("desk-regressions-" + UUID().uuidString).resolvingSymlinksInPath()
         try Core.privateDirectory(root)
         defer { try? fm.removeItem(at: root) }
+        precondition(DownloadedIPA.versionForFilename("未知版本", versionID: "123") == "版本ID-123")
+        precondition(DownloadedIPA.versionForFilename("  未知版本  ", versionID: "124") == "版本ID-124")
+        precondition(DownloadedIPA.versionForFilename("", versionID: "125") == "版本ID-125")
+        precondition(DownloadedIPA.versionForFilename(nil, versionID: "") == nil)
+        precondition(DownloadedIPA.versionForFilename("2.4", versionID: "123") == "2.4")
+        precondition(DownloadedIPA.filename(for: "Synthetic/App", noUpdate: false, version: "2.4") == "Synthetic App_2.4.ipa")
+        precondition(DownloadedIPA.filename(for: "Synthetic", noUpdate: true, version: "2.4") == "Synthetic_2.4_no-update.ipa")
+        let legacyDownload = try JSONDecoder().decode(DownloadedIPA.self, from: Data(#"{"url":"file:///tmp/synthetic.ipa","appName":"Synthetic"}"#.utf8))
+        precondition(legacyDownload.accountID == nil && legacyDownload.stamp == nil)
+        let occupied = root.appendingPathComponent("Synthetic_2.4.ipa")
+        try Data().write(to: occupied)
+        let unused = try DownloadedIPA.unusedTarget(named: occupied.lastPathComponent, in: root)
+        precondition(unused.url.lastPathComponent == "Synthetic_2.4-2.ipa" && unused.original == nil)
+        let sourceStamp = try Core.fileStamp(occupied)
+        let downloadRecord = DownloadedIPA(url: occupied, appName: "Synthetic", accountID: UUID(), version: "2.4", stamp: sourceStamp)
+        let decodedRecord = try JSONDecoder().decode(DownloadedIPA.self, from: JSONEncoder().encode(downloadRecord))
+        precondition(decodedRecord.accountID == downloadRecord.accountID && decodedRecord.stamp == sourceStamp)
+        let metadata = try JSONDecoder().decode(IPAMetadata.self, from: Data(#"{"path":"/tmp/synthetic.ipa","status":"encrypted","name":"Synthetic","bundle_id":"example.synthetic","version":"2.4","bytes":123,"selector_ids":["00000001:00000002"],"selector_scan_complete":true}"#.utf8))
+        precondition(metadata.bundleID == "example.synthetic" && metadata.selectorScanComplete == true && metadata.status == .encrypted)
+        let hintProfile = Profile(id: UUID(), name: "Synthetic")
+        func hint(_ selectors: Set<String>, state: ModelCheckState?) -> IPAModelHint? {
+            IPAModelHint.resolve(metadata, profiles: [hintProfile], selected: hintProfile.id,
+                                 selectors: [hintProfile.id: selectors], states: state.map { [hintProfile.id: $0] } ?? [:])
+        }
+        precondition(hint([], state: nil)?.text == "正在校验模型…")
+        precondition(hint([], state: .checking)?.text == "正在校验模型…")
+        precondition(hint([], state: .valid)?.text == "模型关联待确认")
+        precondition(hint([], state: .invalid)?.text == "尚未找到匹配模型")
+        precondition(hint(["00000001:00000002"], state: .valid)?.text == "当前档案模型匹配")
+        let incompleteMetadata = try JSONDecoder().decode(IPAMetadata.self, from: Data(#"{"path":"/tmp/synthetic.ipa","status":"encrypted","selector_ids":["00000001:00000002"],"selector_scan_complete":false}"#.utf8))
+        precondition(IPAModelHint.resolve(incompleteMetadata, profiles: [hintProfile], selected: hintProfile.id,
+                                         selectors: [:], states: [hintProfile.id: .invalid])?.text == "许可信息未确认")
+        if let sourceStamp {
+            let savedEntry = IPAStatusEntry(stamp: sourceStamp, metadata: metadata, icon: nil).saved(at: occupied, stamp: sourceStamp)
+            precondition(savedEntry.metadata.path == occupied.path && savedEntry.stamp == sourceStamp && savedEntry.metadata.version == "2.4")
+        }
+        let scanDirectory = root.appendingPathComponent("scan-files")
+        try Core.privateDirectory(scanDirectory)
+        let scanFile = scanDirectory.appendingPathComponent("cached.ipa")
+        try Data("synthetic".utf8).write(to: scanFile)
+        let scanStamp = try Core.fileStamp(scanFile)!
+        let scanEntry = IPAStatusEntry(stamp: scanStamp, metadata: metadata, icon: nil).saved(at: scanFile, stamp: scanStamp)
+        var scanCache = [scanFile: scanEntry]
+        let scanRequest = IPAFolderScan(folder: scanDirectory, revision: 1, additionalFiles: [], selection: [])
+        let selectedRequest = IPAFolderScan(folder: scanDirectory, revision: 1, additionalFiles: [], selection: [scanFile])
+        precondition(scanRequest == selectedRequest)
+        var enumerated = false
+        var scanCalls = 0
+        let lateFile = root.appendingPathComponent("new-download.ipa")
+        try Data("new".utf8).write(to: lateFile)
+        let lateStamp = try Core.fileStamp(lateFile)!
+        let lateEntry = IPAStatusEntry(stamp: lateStamp, metadata: metadata, icon: nil).saved(at: lateFile, stamp: lateStamp)
+        await scanRequest.run(cache: { scanCache }, listed: { result in
+            precondition((try? result.get()) == [scanFile]); enumerated = true
+        }, apply: { scanCache = $0 }, read: { files, baseline in
+            scanCalls += 1
+            precondition(enumerated && files == [scanFile] && baseline[scanFile]?.stamp == scanStamp)
+            scanCache[lateFile] = lateEntry
+            return baseline
+        })
+        precondition(scanCalls == 1 && scanCache[scanFile]?.stamp == scanStamp && scanCache[lateFile]?.stamp == lateStamp)
+        let importedRequest = IPAFolderScan(folder: scanDirectory, revision: 1, additionalFiles: [lateFile], selection: [])
+        precondition(importedRequest != scanRequest)
+        await importedRequest.run(cache: { scanCache }, listed: { _ in }, apply: { scanCache = $0 }, read: { files, baseline in
+            precondition(Set(files) == [scanFile, lateFile])
+            try! Data("changed file".utf8).write(to: scanFile)
+            let freshStamp = try! Core.fileStamp(scanFile)!
+            scanCache[scanFile] = scanEntry.saved(at: scanFile, stamp: freshStamp)
+            return [scanFile: scanEntry]
+        })
+        precondition(scanCache[scanFile]?.stamp == (try! Core.fileStamp(scanFile)))
+        var resumeScan: CheckedContinuation<[URL: IPAStatusEntry], Never>?
+        var cancelledScanApplied = false
+        let cancelledScan = Task { @MainActor in
+            await importedRequest.run(cache: { scanCache }, listed: { _ in }, apply: { _ in cancelledScanApplied = true }, read: { _, _ in
+                await withCheckedContinuation { resumeScan = $0 }
+            })
+        }
+        await waitUntil { resumeScan != nil }
+        cancelledScan.cancel()
+        resumeScan?.resume(returning: [:])
+        await cancelledScan.value
+        precondition(!cancelledScanApplied && scanCache[lateFile] != nil)
+        print("PASS: sequential directory scan, saved/external cache reuse, stale-result preservation and scan cancellation")
+
+        let reportDirectory = root.appendingPathComponent("report-fixture/Reports")
+        try Core.privateDirectory(reportDirectory)
+        let reportOutput = root.appendingPathComponent("synthetic-result.ipa")
+        let reportJSON: [String: Any] = [
+            "input": ["path": root.appendingPathComponent("synthetic-input.ipa").path, "sha256": "input-hash"],
+            "output": ["path": reportOutput.path, "sha256": "output-hash"],
+            "complete": true, "plaintext_verified": false,
+            "images": [["member": "Payload/Test.app/Test", "first_page_audit": "arm64-instruction-decode"]]
+        ]
+        try Core.writeJSON(reportJSON, to: reportDirectory.appendingPathComponent("synthetic.json"))
+        let savedReport = try IPASavedReport.find(for: reportOutput, root: reportDirectory.deletingLastPathComponent())
+        precondition(savedReport.document.output.sha256 == "output-hash")
+        precondition(savedReport.document.images?.first?.auditDescription == "ARM64 指令结构审计")
         precondition(Core.appID("https://apps.apple.com/jp/app/test/id6474479684?l=ja") == "6474479684")
         precondition(Core.appID("6474479684") == "6474479684")
         precondition(Core.appID("https://evil.example/id123") == nil && Core.appID("0") == nil)
+        precondition(UpdateChecker.isNewer("v1.5.8", than: "1.5.8-beta.2"))
+        precondition(UpdateChecker.isNewer("v1.6.0", than: "1.5.8"))
+        precondition(!UpdateChecker.isNewer("v1.5.7", than: "1.5.8-beta.2"))
+        precondition(!UpdateChecker.isNewer("v1.5.8", than: "1.5.8"))
+        precondition(!UpdateChecker.isNewer("", than: "1.5.8"))
+        precondition(!UpdateChecker.isNewer("1.5.bad.9", than: "1.5.8"))
         let history = try CatalogService.parseHistory(Data(#"[{"external_identifier":868540902,"bundle_version":"1.2.9"},{"external_identifier":"868540902","bundle_version":"duplicate"},{"external_identifier":"12x","bundle_version":"invalid"},{"versionId":"868540901","version":"1.2.8"}]"#.utf8))
         precondition(history.map(\.id) == ["868540902", "868540901"])
         precondition(history.first?.version == "1.2.9")
@@ -58,6 +162,12 @@ import Darwin
         precondition(DownloadCatalog.country(forStoreFront: "unknown") == "US")
         precondition(Core.storeFront(in: #"{"success":false,"email":"test@example.com","storeFront":"143462"}"#) == nil)
         precondition(Core.storeFront(in: #"{"success":true,"email":"test@example.com","storeFront":"143462-1,32"}"#) == "143462-1,32")
+        precondition(Core.storeFront(in: #"{"sessionRefreshed":true,"email":"test@example.com","storeFront":"143462-1,32"}"#) == "143462-1,32")
+        let refreshedSession = Core.refreshedSession(in: #"{"sessionRefreshed":true,"email":" Test@Example.com ","storeFront":"143462-1,32"}"# + "\n" + #"{"level":"error","error":"license is required"}"#)
+        precondition(refreshedSession?.email == "test@example.com" && refreshedSession?.storeFront == "143462-1,32")
+        precondition(Core.refreshedSession(in: #"{"sessionRefreshed":false,"email":"test@example.com"}"#) == nil)
+        precondition(Core.refreshedSession(in: #"{"sessionRefreshed":true,"email":"   "}"#) == nil)
+        precondition(Core.email(in: #"{"sessionRefreshed":true,"email":"test@example.com"}"#) == nil)
         let iosdump = try CatalogService.parseHistory(Data(#"{"code":200,"total":1,"data":[{"bundle_version":"1.4.2","external_identifier":894154892,"created_at":"2026-10-30 19:32:28"}]}"#.utf8))
         precondition(iosdump.first?.id == "894154892" && iosdump.first?.version == "1.4.2")
         precondition(VersionSource.allCases.map(\.rawValue) == ["Timbrd", "Bilin", "iOSDump"])
@@ -112,7 +222,7 @@ import Darwin
         precondition(ok && runner.output.contains("accepted") && !runner.output.contains("synthetic-secret"))
         let goInput = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().appendingPathComponent("GoInputTest")
         let goInteraction = await withCheckedContinuation { continuation in
-            runner.launch(goInput, [], title: "Go terminal input") { continuation.resume(returning: $0) }
+            runner.launch(goInput, [], title: "Go terminal input", sessionAccount: UUID()) { continuation.resume(returning: $0) }
             Task { @MainActor in
                 await waitUntil("timed out waiting for the synthetic Go password prompt") {
                     runner.inputPrompt == .password
@@ -129,7 +239,20 @@ import Darwin
         }
         precondition(goInteraction && runner.output.contains("verification accepted") && !runner.canReply)
         precondition(!runner.output.contains("synthetic-go-secret") && !runner.output.contains("123456"))
-        print("PASS: synthetic 2FA prompt recognized, six-digit code accepted without echo")
+        let ambiguousOutcome = await withCheckedContinuation { continuation in
+            runner.launch(goInput, ["--ambiguous"], title: "Go ambiguous login") { continuation.resume(returning: $0) }
+            Task { @MainActor in
+                await waitUntil("timed out waiting for the ambiguous verification prompt") {
+                    runner.inputPrompt == .verificationChoice
+                }
+                precondition(runner.canReply && runner.title == "等待确认登录")
+                runner.reply("")
+                precondition(!runner.canReply)
+            }
+        }
+        precondition(!ambiguousOutcome && !runner.cancelled && !runner.canReply)
+        precondition(runner.hint == "请核对 Apple 账户和密码。收到本次登录的验证码后，可以选择继续验证。")
+        print("PASS: synthetic 2FA prompt recognized, six-digit code accepted without echo, ambiguous empty-code reply surfaces password guidance")
         let chained = await withCheckedContinuation { continuation in
             runner.launch(URL(fileURLWithPath: "/usr/bin/true"), [], title: "first") { first in
                 precondition(first)
@@ -137,6 +260,35 @@ import Darwin
             }
         }
         precondition(chained)
+        let batchRunner = Runner(verify: {})
+        let batchToken = batchRunner.beginBatch("synthetic batch")!
+        for index in 0..<2 {
+            precondition(batchRunner.busy && Runner.active[batchRunner.id] != nil)
+            let child = await withCheckedContinuation { continuation in
+                batchRunner.launch(URL(fileURLWithPath: "/usr/bin/true"), [], title: "batch \(index)", holdsCompletion: true, batchID: batchToken) {
+                    continuation.resume(returning: $0)
+                }
+            }
+            precondition(child && batchRunner.busy && batchRunner.saving)
+            batchRunner.finishCompletion()
+            precondition(batchRunner.busy && !batchRunner.saving && Runner.active[batchRunner.id] != nil)
+            await Task.yield()
+            precondition(batchRunner.busy)
+        }
+        batchRunner.finishBatch(batchToken)
+        precondition(!batchRunner.busy && Runner.active[batchRunner.id] == nil)
+        let cancellationToken = batchRunner.beginBatch("cancel between files")!
+        batchRunner.stop()
+        let blockedChild = await withCheckedContinuation { continuation in
+            batchRunner.launch(URL(fileURLWithPath: "/usr/bin/touch"), [unlaunched.path], title: "cancelled batch", batchID: cancellationToken) {
+                continuation.resume(returning: $0)
+            }
+        }
+        precondition(!blockedChild && batchRunner.busy && !fm.fileExists(atPath: unlaunched.path))
+        batchRunner.finishBatch(cancellationToken)
+        precondition(!batchRunner.busy)
+        print("PASS: batch stays tracked between files, accepts its next child and cancels before the next launch")
+
         let failed = await withCheckedContinuation { continuation in
             runner.launch(URL(fileURLWithPath: "/usr/bin/false"), [], title: "failure") { continuation.resume(returning: $0) }
         }
@@ -333,6 +485,52 @@ import Darwin
         precondition(!cachedStore.modelReady)
         print("PASS: unchanged model cache reuse, content/permission invalidation, same-name damaged model repair")
 
+        let delayedChecker = root.appendingPathComponent("delayed-modelcheck")
+        let startedCheck = root.appendingPathComponent("background-check-started")
+        let releaseCheck = root.appendingPathComponent("background-check-release")
+        func shellQuote(_ value: String) -> String { "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+        let checkerScript = """
+        #!/bin/zsh
+        if [[ ! -e \(shellQuote(startedCheck.path)) ]]; then
+          /usr/bin/touch \(shellQuote(startedCheck.path))
+          while [[ ! -e \(shellQuote(releaseCheck.path)) ]]; do /bin/sleep 0.02; done
+        fi
+        exec \(shellQuote(checker.path)) "$@"
+        """
+        try checkerScript.write(to: delayedChecker, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: delayedChecker.path)
+        let backgroundStore = Store(root: root.appendingPathComponent("background-models"), modelTool: delayedChecker)
+        let foregroundProfile = backgroundStore.add("Foreground")!
+        await waitUntil { backgroundStore.modelCheckStates[foregroundProfile.id] == .invalid }
+        let backgroundProfile = backgroundStore.add("Background")!
+        await waitUntil { backgroundStore.modelCheckStates[backgroundProfile.id] == .invalid }
+        backgroundStore.selected = foregroundProfile.id
+        let backgroundModel = backgroundStore.root.appendingPathComponent("Models/\(backgroundProfile.id.uuidString)/synthetic.bin")
+        try validModel(backgroundModel)
+        backgroundStore.refreshModel(accountID: backgroundProfile.id)
+        await waitUntil("background checker did not start") { fm.fileExists(atPath: startedCheck.path) }
+        try fm.setAttributes([.modificationDate: Date().addingTimeInterval(10)], ofItemAtPath: backgroundModel.path)
+        try Data().write(to: releaseCheck)
+        await waitUntil("changed background model was not rechecked") { backgroundStore.modelCheckStates[backgroundProfile.id] == .valid }
+        precondition(backgroundStore.selected == foregroundProfile.id && !backgroundStore.modelReady)
+        try fm.removeItem(at: startedCheck)
+        try fm.removeItem(at: releaseCheck)
+        backgroundStore.refreshModel(accountID: backgroundProfile.id, force: true)
+        await waitUntil("background version checker did not start") { fm.fileExists(atPath: startedCheck.path) }
+        backgroundStore.refreshModel(accountID: backgroundProfile.id, force: true)
+        try Data().write(to: releaseCheck)
+        await waitUntil("invalidated background model was not rechecked") { backgroundStore.modelCheckStates[backgroundProfile.id] == .valid }
+        precondition(backgroundStore.selected == foregroundProfile.id && !backgroundStore.modelReady)
+        try fm.removeItem(at: startedCheck)
+        try fm.removeItem(at: releaseCheck)
+        backgroundStore.refreshModel(accountID: backgroundProfile.id, force: true)
+        try backgroundStore.markDeleting(backgroundProfile.id)
+        await waitUntil("deleted profile check did not finish") { !backgroundStore.checks.contains(backgroundProfile.id) }
+        precondition(!fm.fileExists(atPath: startedCheck.path))
+        precondition(backgroundStore.modelSelectors[backgroundProfile.id] == nil && backgroundStore.modelCheckStates[backgroundProfile.id] == nil)
+        precondition(backgroundStore.selected == foregroundProfile.id)
+        print("PASS: incomplete license, pending/legacy model hints, saved metadata reuse and non-selected model recheck")
+
         let danglingRoot = root.appendingPathComponent("dangling-registry")
         try Core.privateDirectory(danglingRoot)
         let danglingRegistry = danglingRoot.appendingPathComponent("profiles.json")
@@ -420,14 +618,44 @@ import Darwin
         print("PASS: account storefront mapping, default US, persistent session region, logout clears region without unbinding identity, iOSDump schema")
         do { try store.bindIdentity(a.id, email: "different@example.com"); preconditionFailure("must reject wrong ID") } catch {}
         do { try store.bindIdentity(b.id, email: "japan@example.com"); preconditionFailure("must reject duplicate ID") } catch {}
+        let unrefreshed = try store.bindRefreshedSession(b.id, in: #"{"level":"error","error":"license is required"}"#)
+        precondition(!unrefreshed)
+        do {
+            _ = try store.bindRefreshedSession(b.id, in: #"{"sessionRefreshed":true,"email":" Japan@Example.com ","storeFront":"143462"}"# + "\n" + #"{"level":"error","error":"license is required"}"#)
+            preconditionFailure("must reject refreshed duplicate ID")
+        } catch {
+            precondition(error.localizedDescription.contains("已绑定其他档案"))
+        }
+        precondition(store.profiles.first(where: { $0.id == b.id })?.appleID == nil && store.profiles.first(where: { $0.id == b.id })?.storeFront == nil)
+        do {
+            _ = try store.bindRefreshedSession(a.id, in: #"{"sessionRefreshed":true,"email":"different@example.com","storeFront":"143441"}"# + "\n" + #"{"level":"error","error":"license is required"}"#)
+            preconditionFailure("must reject refreshed mismatched ID")
+        } catch {
+            precondition(error.localizedDescription.contains("不一致"))
+        }
+        precondition(store.profiles.first(where: { $0.id == a.id })?.appleID == "japan@example.com" && store.profiles.first(where: { $0.id == a.id })?.storeFront == "143465")
+        let refreshedA = try store.bindRefreshedSession(a.id, in: #"{"sessionRefreshed":true,"email":" Japan@Example.com ","storeFront":"143462-1,32"}"# + "\n" + #"{"level":"error","error":"license is required"}"#)
+        precondition(refreshedA)
+        precondition(store.profiles.first(where: { $0.id == a.id })?.storeFront == "143462-1,32")
+        let refreshedNoStoreFront = try store.bindRefreshedSession(a.id, in: #"{"sessionRefreshed":true,"email":"japan@example.com"}"#)
+        precondition(refreshedNoStoreFront)
+        precondition(store.profiles.first(where: { $0.id == a.id })?.storeFront == "143462-1,32")
         try store.markDeleting(a.id)
         precondition(store.profiles.first(where: { $0.id == a.id })?.deletionPending == true)
         try store.remove(a)
         precondition(store.profiles.count == 1 && store.selected == b.id)
+        let refreshedB = try store.bindRefreshedSession(b.id, in: #"{"sessionRefreshed":true,"email":" US@Example.com ","storeFront":"143441-1,29"}"#)
+        precondition(refreshedB)
+        precondition(store.profiles.first(where: { $0.id == b.id })?.appleID == "us@example.com" && store.profiles.first(where: { $0.id == b.id })?.storeFront == "143441-1,29")
         let second = Store(root: goodRoot)
         precondition(!second.storageReady)
         let external = Data("external update".utf8)
         try external.write(to: goodRoot.appendingPathComponent("profiles.json"))
+        do {
+            _ = try store.bindRefreshedSession(b.id, in: #"{"sessionRefreshed":true,"email":"us@example.com","storeFront":"143462"}"#)
+            preconditionFailure("must reject refreshed session save after external registry change")
+        } catch {}
+        precondition(store.profiles.first(where: { $0.id == b.id })?.storeFront == "143441-1,29")
         precondition(store.add("Overwrite") == nil)
         precondition(try! Data(contentsOf: goodRoot.appendingPathComponent("profiles.json")) == external)
         print("PASS: unreadable/corrupt registry write protection, optimistic update check, instance lock, bound account identity, duplicate prevention, pending-delete state and last-account selection")
@@ -458,6 +686,11 @@ import Darwin
         try Core.removeAccountData(owner, root: explicitRoot)
         precondition(!fm.fileExists(atPath: explicitReport.path))
         precondition(Core.errorHint("license is required").contains("无需清除登录"))
+        precondition(Core.errorHint("free app license rejected after sign-in refresh").contains("获取"))
+        precondition(Core.errorHint("generate Store AMD proof: store AMD state is not provisioned").contains("商店设备认证信息"))
+        precondition(Core.errorHint("AppleMediaServices returned no Store AMD proof (<nil>)").contains("商店设备认证信息"))
+        precondition(Core.errorHint("version metadata account does not match selected profile").contains("所选账户不一致"))
+        precondition(Core.errorHint("failed to refresh Apple login: password is required to sign in").contains("登录会话已过期"))
         precondition(Core.email(in: "{\"success\":true,\"email\":\"A@Example.com\"}") == "a@example.com")
         print("PASS: abandoned staging recovery, account email parsing and actionable Chinese error hints")
         await waitUntil { Runner.active.isEmpty }

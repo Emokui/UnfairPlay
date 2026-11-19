@@ -14,6 +14,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
+	"time"
 
 	"github.com/majd/ipatool/v2/pkg/util/operatingsystem"
 	. "github.com/onsi/ginkgo/v2"
@@ -129,13 +131,15 @@ var _ = Describe("AppStore (macOS download)", func() {
 
 	It("cancels the package request and cleans staging", func() {
 		started := make(chan struct{})
+		var markStarted sync.Once
 		cancelServer := httptest.NewServer(gohttp.HandlerFunc(func(writer gohttp.ResponseWriter, request *gohttp.Request) {
-			close(started)
+			markStarted.Do(func() { close(started) })
 			<-request.Context().Done()
 		}))
 		DeferCleanup(cancelServer.Close)
 
 		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 		store := &appstore{
 			httpClient:          newDownloadTestClient(),
 			macDecrypterFactory: factory,
@@ -150,8 +154,15 @@ var _ = Describe("AppStore (macOS download)", func() {
 			done <- err
 		}()
 
-		<-started
-		cancel()
+		select {
+		case <-started:
+			cancel()
+		case err := <-done:
+			Fail(fmt.Sprintf("downloadMacPackage returned before starting request: %v", err))
+		case <-time.After(5 * time.Second):
+			cancel()
+			Fail("timed out waiting for macOS package request to start")
+		}
 
 		Eventually(done).Should(Receive(MatchError(ContainSubstring(context.Canceled.Error()))))
 		Expect(destination).ToNot(BeAnExistingFile())

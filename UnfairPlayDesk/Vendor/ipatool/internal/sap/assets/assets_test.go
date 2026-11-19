@@ -47,3 +47,22 @@ func TestReadCacheFile(t *testing.T) {
 		})
 	}
 }
+
+func TestVerifiedDigestRequiresExactLoaderVerifiedSlice(t *testing.T) {
+	spec := requiredFiles[0]
+	unverified := Bundle{AppleMediaServices: make([]byte, spec.size)}
+	if _, ok := unverified.VerifiedDigest(spec.name, unverified.AppleMediaServices); ok {
+		t.Fatal("unverified bundle must not report a verified digest")
+	}
+
+	verified := markBundleVerified(unverified)
+	digest, ok := verified.VerifiedDigest(spec.name, verified.AppleMediaServices)
+	if !ok || digest != spec.digest {
+		t.Fatalf("expected pinned digest for verified slice, got ok=%v", ok)
+	}
+
+	cloned := bytes.Clone(verified.AppleMediaServices)
+	if _, ok := verified.VerifiedDigest(spec.name, cloned); ok {
+		t.Fatal("distinct backing slice must not bypass SHA-256 computation")
+	}
+}

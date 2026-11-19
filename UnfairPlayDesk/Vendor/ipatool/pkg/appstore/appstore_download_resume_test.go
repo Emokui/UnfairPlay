@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
 	"github.com/majd/ipatool/v2/pkg/util/operatingsystem"
@@ -76,7 +77,7 @@ func TestDownloadFileValidatesResumeResponses(t *testing.T) {
 		{name: "malformed range", status: http.StatusPartialContent, rangeHeader: "bytes 7-x/15", body: "download", want: "partial", wantError: true},
 		{name: "invalid total", status: http.StatusPartialContent, rangeHeader: "bytes 7-14/14", body: "download", want: "partial", wantError: true},
 		{name: "length mismatch", status: http.StatusPartialContent, rangeHeader: "bytes 7-14/15", body: "bad", want: "partial", wantError: true},
-		{name: "truncated chunked response", status: http.StatusPartialContent, rangeHeader: "bytes 7-14/15", body: "dow", want: "partialdow", wantError: true, chunked: true},
+		{name: "truncated chunked response", status: http.StatusPartialContent, rangeHeader: "bytes 7-14/15", body: "dow", want: "partialdownload", chunked: true},
 	} {
 		for _, interactive := range []bool{false, true} {
 			t.Run(test.name+map[bool]string{false: "/non-interactive", true: "/interactive"}[interactive], func(t *testing.T) {
@@ -85,9 +86,20 @@ func TestDownloadFileValidatesResumeResponses(t *testing.T) {
 					t.Fatal(err)
 				}
 
+				var requests atomic.Int32
 				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					if r.Header.Get("Range") != "bytes=7-" {
-						t.Errorf("range = %q", r.Header.Get("Range"))
+					attempt := requests.Add(1)
+					if test.chunked && attempt == 2 {
+						if got := r.Header.Get("Range"); got != "bytes=10-" {
+							t.Errorf("resumed range = %q, want bytes=10-", got)
+						}
+						w.Header().Set("Content-Range", "bytes 10-14/15")
+						w.WriteHeader(http.StatusPartialContent)
+						_, _ = io.WriteString(w, "nload")
+						return
+					}
+					if got := r.Header.Get("Range"); got != "bytes=7-" {
+						t.Errorf("initial range = %q, want bytes=7-", got)
 					}
 
 					if test.rangeHeader != "" {
@@ -114,6 +126,13 @@ func TestDownloadFileValidatesResumeResponses(t *testing.T) {
 				err := store.downloadFile(context.Background(), server.URL, path, progress)
 				if (err != nil) != test.wantError {
 					t.Fatalf("download error = %v", err)
+				}
+				wantRequests := int32(1)
+				if test.chunked {
+					wantRequests = 2
+				}
+				if got := requests.Load(); got != wantRequests {
+					t.Fatalf("requests = %d, want %d", got, wantRequests)
 				}
 
 				data, err := os.ReadFile(path)

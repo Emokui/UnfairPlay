@@ -20,7 +20,7 @@ const storeAnisetteDSID = ^uint64(0)
 
 // ProvisionStoreAnisette completes the Store-specific ADI provisioning action
 // returned by auth.itunes.apple.com.
-func ProvisionStoreAnisette(ctx context.Context, client *http.Client, encoded []byte, challenge, endpoint, userAgent, kbsync string, hardwareID []byte, identity http.Header) ([]byte, error) {
+func ProvisionStoreAnisette(ctx context.Context, client *http.Client, encoded []byte, challenge, endpoint, userAgent, kbsync string, hardwareID []byte) ([]byte, error) {
 	if client == nil {
 		return nil, errors.New("anisette HTTP client is nil")
 	}
@@ -29,6 +29,10 @@ func ProvisionStoreAnisette(ctx context.Context, client *http.Client, encoded []
 	if err != nil {
 		return nil, err
 	}
+
+	state.Provisioning = nil
+	state.RoutingInfo = 0
+	state.Kind = stateKindStore
 
 	spim, err := base64.StdEncoding.DecodeString(strings.TrimSpace(challenge))
 	if err != nil || len(spim) == 0 || len(spim) > anisetteLimit {
@@ -57,7 +61,7 @@ func ProvisionStoreAnisette(ctx context.Context, client *http.Client, encoded []
 		payload["kbsync"] = kbsync
 	}
 
-	settingValue, transportValue, keyBag, err := finishStoreProvisioning(ctx, client, payload, endpoint, userAgent, identity)
+	settingValue, transportValue, keyBag, err := finishStoreProvisioning(ctx, client, payload, endpoint, userAgent, deviceIdentityHeaders(state.Identifier))
 	if err != nil {
 		return nil, err
 	}
@@ -86,6 +90,8 @@ func ProvisionStoreAnisette(ctx context.Context, client *http.Client, encoded []
 	if err != nil {
 		return nil, fmt.Errorf("persist Apple Store provisioning: %w", err)
 	}
+	state.RoutingInfo = 0
+	state.Kind = stateKindStore
 
 	updated, err := json.Marshal(state)
 	if err != nil {
@@ -106,11 +112,7 @@ func finishStoreProvisioning(ctx context.Context, client *http.Client, payload m
 		return "", "", nil, fmt.Errorf("create Apple Store provisioning request: %w", err)
 	}
 
-	for key, values := range identity {
-		if !strings.EqualFold(key, "X-Apple-I-MD") && !strings.EqualFold(key, "X-Apple-I-MD-M") && !strings.EqualFold(key, "X-Apple-I-MD-RINFO") {
-			request.Header[key] = append([]string(nil), values...)
-		}
-	}
+	request.Header = identity.Clone()
 
 	request.Header.Set("Accept", "*/*")
 	request.Header.Set("Content-Type", "application/x-apple-plist")

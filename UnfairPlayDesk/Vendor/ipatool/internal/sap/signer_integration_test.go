@@ -20,7 +20,7 @@ func TestSignerIntegration(t *testing.T) {
 var _ = Describe("SAP signer integration", func() {
 	It("signs distinct payloads with distinct signatures", func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		defer cancel()
+		DeferCleanup(cancel)
 
 		var signer ActionSigner
 

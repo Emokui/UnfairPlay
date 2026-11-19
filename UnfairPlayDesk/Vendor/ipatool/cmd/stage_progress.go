@@ -6,6 +6,9 @@ import "time"
 func newStageReporter() func(string) {
 	var started, previous time.Time
 	return func(message string) {
+		if dependencies.Logger == nil {
+			return
+		}
 		now := time.Now()
 		if started.IsZero() {
 			started = now

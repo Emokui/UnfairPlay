@@ -2,11 +2,26 @@ import SwiftUI
 
 enum DeskAppearance {
     static let icon = Bundle.main.resourceURL.flatMap { NSImage(contentsOf: $0.appendingPathComponent("AppIcon.png")) }
-    static let accent = Color(red: 0.36, green: 0.36, blue: 0.82)
-    static let background = Color(red: 0.965, green: 0.968, blue: 0.982)
-    static let sidebar = Color(red: 0.935, green: 0.941, blue: 0.964)
-    static let surface = Color.white
+    private static func adaptive(_ name: String, light: NSColor, dark: NSColor) -> Color {
+        Color(nsColor: NSColor(name: NSColor.Name(name)) { appearance in
+            appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? dark : light
+        })
+    }
+    static let accent = adaptive("deskAccent", light: NSColor(srgbRed: 0.36, green: 0.36, blue: 0.82, alpha: 1),
+                                 dark: NSColor(srgbRed: 0.68, green: 0.66, blue: 1, alpha: 1))
+    static let activeFill = adaptive("deskActiveFill", light: NSColor(srgbRed: 0.36, green: 0.36, blue: 0.82, alpha: 1),
+                                     dark: NSColor(srgbRed: 0.36, green: 0.33, blue: 0.72, alpha: 1))
+    static let background = adaptive("deskBackground", light: NSColor(srgbRed: 0.965, green: 0.968, blue: 0.982, alpha: 1),
+                                     dark: NSColor(srgbRed: 0.105, green: 0.11, blue: 0.14, alpha: 1))
+    static let sidebar = adaptive("deskSidebar", light: NSColor(srgbRed: 0.935, green: 0.941, blue: 0.964, alpha: 1),
+                                  dark: NSColor(srgbRed: 0.125, green: 0.13, blue: 0.165, alpha: 1))
+    static let surface = adaptive("deskSurface", light: .white,
+                                  dark: NSColor(srgbRed: 0.16, green: 0.165, blue: 0.20, alpha: 1))
     static let contentWidth: CGFloat = 780
+    @MainActor static func apply(_ preference: String) {
+        let name: NSAppearance.Name? = preference == "dark" ? .darkAqua : preference == "light" ? .aqua : nil
+        NSApp.appearance = name.flatMap { NSAppearance(named: $0) }
+    }
 }
 
 struct DeskSheetHeader: View {
@@ -44,7 +59,7 @@ struct DeskPrimaryButtonStyle: ButtonStyle {
             .font(.system(size: compact ? 11 : 12, weight: .semibold))
             .padding(.horizontal, compact ? 13 : 18).padding(.vertical, compact ? 7 : 11)
             .foregroundStyle(enabled ? Color.white : DeskAppearance.accent.opacity(0.35))
-            .background(enabled ? DeskAppearance.accent.opacity(configuration.isPressed ? 0.8 : 1) : DeskAppearance.accent.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
+            .background(enabled ? DeskAppearance.activeFill.opacity(configuration.isPressed ? 0.8 : 1) : DeskAppearance.accent.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
             .contentShape(RoundedRectangle(cornerRadius: 10))
     }
 }

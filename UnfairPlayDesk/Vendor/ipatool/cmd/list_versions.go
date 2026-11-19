@@ -30,32 +30,34 @@ func ListVersionsCmd() *cobra.Command {
 				return err
 			}
 
+			store := dependencies.AppStore
+			infoResult, err := store.AccountInfo()
+			if err != nil {
+				return err
+			}
+
+			acc := infoResult.Account
 			var lastErr error
-			var acc appstore.Account
+			refreshed := false
+			interactive := isInteractive(cmd.Context())
+			stage := newStageReporter()
 
 			return retry.Do(func() error {
-				infoResult, err := dependencies.AppStore.AccountInfo()
-				if err != nil {
-					return err
-				}
-
-				acc = infoResult.Account
-
-				if errors.Is(lastErr, appstore.ErrPasswordTokenExpired) {
-					loginResult, err := dependencies.AppStore.Login(appstore.LoginInput{
-						Email:    acc.Email,
-						Password: acc.Password,
-					})
+				if appstore.IsSessionRefreshRequired(lastErr) {
+					refreshed = true
+					stage("正在更新 Apple 登录会话")
+					loginResult, err := refreshDownloadLogin(cmd.Context(), store, acc, interactive)
 					if err != nil {
-						return err
+						return wrapSessionRefreshError(lastErr, err)
 					}
 
 					acc = loginResult.Account
+					emitRefreshedSession(acc)
 				}
 
 				app := appstore.App{ID: appID}
 				if bundleID != "" {
-					lookupResult, err := dependencies.AppStore.Lookup(appstore.LookupInput{Account: acc, BundleID: bundleID, Platform: platform})
+					lookupResult, err := store.Lookup(appstore.LookupInput{Account: acc, BundleID: bundleID, Platform: platform})
 					if err != nil {
 						return err
 					}
@@ -63,16 +65,19 @@ func ListVersionsCmd() *cobra.Command {
 					app = lookupResult.App
 				}
 
-				out, err := dependencies.AppStore.ListVersions(appstore.ListVersionsInput{Context: cmd.Context(), Account: acc, App: app, Platform: platform})
+				out, err := store.ListVersions(appstore.ListVersionsInput{Context: cmd.Context(), Account: acc, App: app, Platform: platform})
 				if err != nil {
 					return err
 				}
 
-				dependencies.Logger.Log().
+				event := dependencies.Logger.Log().
 					Interface("externalVersionIdentifiers", out.ExternalVersionIdentifiers).
 					Str("bundleID", app.BundleID).
-					Bool("success", true).
-					Send()
+					Bool("success", true)
+				if refreshed {
+					event = event.Str("email", acc.Email).Str("storeFront", acc.StoreFront)
+				}
+				event.Send()
 
 				return nil
 			},
@@ -83,7 +88,7 @@ func ListVersionsCmd() *cobra.Command {
 				retry.RetryIf(func(err error) bool {
 					lastErr = err
 
-					return errors.Is(err, appstore.ErrPasswordTokenExpired)
+					return !refreshed && appstore.IsSessionRefreshRequired(err)
 				}),
 			)
 		},

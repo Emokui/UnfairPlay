@@ -11,13 +11,12 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/majd/ipatool/v2/internal/sap/assets"
 	"github.com/majd/ipatool/v2/internal/store/emulator"
-	"github.com/majd/ipatool/v2/internal/store/profile"
 	apphttp "github.com/majd/ipatool/v2/pkg/http"
 )
 
@@ -25,8 +24,10 @@ type Backend struct {
 	jar           http.CookieJar
 	macAddress    func() (string, error)
 	mu            sync.Mutex
-	image         []byte
 	bag           map[string]any
+	bagRaw        []byte
+	bagGUID       string
+	bagURL        string
 	transport     *http.Transport
 	authTransport *http.Transport
 }
@@ -57,7 +58,7 @@ func (e *executor) Send(request apphttp.Request, body []byte) (*http.Response, e
 		ctx = context.Background()
 	}
 
-	if e.operation == "bag-direct" {
+	if e.operation == "bag-direct" || e.operation == "catalog" {
 		direct, err := http.NewRequestWithContext(ctx, request.Method, request.URL, bytes.NewReader(body))
 		if err != nil {
 			return nil, fmt.Errorf("create Store request: %w", err)
@@ -71,7 +72,33 @@ func (e *executor) Send(request apphttp.Request, body []byte) (*http.Response, e
 			direct.Header.Set("User-Agent", apphttp.DefaultUserAgent)
 		}
 
-		return e.backend.requestTransport(emulator.Request{Operation: "authenticate", Timeout: request.Timeout})(direct)
+		if e.operation == "catalog" {
+			client := &http.Client{Transport: e.backend.transport, Timeout: request.Timeout}
+			if request.NoRedirects {
+				client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+			}
+			return client.Do(direct)
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		guid := direct.URL.Query().Get("guid")
+		if guid != "" {
+			if raw := e.backend.cachedBagBytes(guid, direct.URL.String()); len(raw) != 0 {
+				return &http.Response{
+					StatusCode:    http.StatusOK,
+					Header:        make(http.Header),
+					Body:          io.NopCloser(bytes.NewReader(raw)),
+					ContentLength: int64(len(raw)),
+					Request:       direct,
+				}, nil
+			}
+		}
+		response, err := e.backend.requestTransport(emulator.Request{Operation: e.operation, Timeout: request.Timeout})(direct)
+		if err != nil || response.StatusCode != http.StatusOK {
+			return response, err
+		}
+		return e.backend.rememberBag(guid, direct.URL.String(), response)
 	}
 
 	// Bound framework preparation too; the network keeps its own I/O limit.
@@ -105,7 +132,7 @@ func (e *executor) Do(request *http.Request) (*http.Response, error) {
 		return e.backend.transfer(request)
 	}
 	if e.operation == "sap" {
-		return e.backend.requestTransport(emulator.Request{Operation: "authenticate", Timeout: apphttp.DefaultAuthenticationTimeout})(request)
+		return e.backend.requestTransport(emulator.Request{Operation: e.operation, Timeout: apphttp.DefaultAuthenticationTimeout})(request)
 	}
 
 	var body []byte
@@ -154,27 +181,6 @@ func (b *Backend) hardware(parameters map[string]any) ([]byte, error) {
 	return data, nil
 }
 
-func (b *Backend) prepare(ctx context.Context) ([]byte, profile.Data, error) {
-	prepared, err := profile.Load(ctx)
-	if err != nil {
-		return nil, profile.Data{}, fmt.Errorf("load Store runtime: %w", err)
-	}
-
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	if b.image == nil {
-		bundle, err := assets.Load(ctx)
-		if err != nil {
-			return nil, profile.Data{}, fmt.Errorf("load Store runtime: %w", err)
-		}
-
-		b.image = bundle.AppleMediaServices
-	}
-
-	return b.image, prepared, nil
-}
-
 func (b *Backend) execute(ctx context.Context, input emulator.Request) (*http.Response, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("store request: %w", err)
@@ -198,31 +204,18 @@ func (b *Backend) execute(ctx context.Context, input emulator.Request) (*http.Re
 		}
 	}
 
-	b.mu.Lock()
-	bag := b.bag
-	b.mu.Unlock()
-
-	if input.Operation == "purchase" && bag == nil {
-		response, err := b.execute(ctx, emulator.Request{URL: "https://init.itunes.apple.com/bag.xml?guid=" + strings.ToUpper(hex.EncodeToString(hardware)), Method: http.MethodGet, Operation: "bag"})
-		if err != nil {
-			return nil, fmt.Errorf("load purchase bag: %w", err)
+	if input.Operation == "purchase" {
+		guid := strings.ToUpper(hex.EncodeToString(hardware))
+		input.Bag = b.cachedBag(guid)
+		if input.Bag == nil {
+			input.Bag, err = b.fetchPurchaseBag(ctx, guid, input.Headers.Get("User-Agent"))
+			if err != nil {
+				return nil, fmt.Errorf("load purchase bag: %w", err)
+			}
 		}
-
-		_ = response.Body.Close()
-
-		b.mu.Lock()
-		bag = b.bag
-		b.mu.Unlock()
 	}
 
-	input.Bag = bag
-
-	image, prepared, err := b.prepare(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("prepare Store framework: %w", err)
-	}
-
-	guest, err := emulator.Open(ctx, image, prepared)
+	guest, err := emulator.OpenPinned(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("open Store framework: %w", err)
 	}
@@ -266,25 +259,77 @@ func (b *Backend) execute(ctx context.Context, input emulator.Request) (*http.Re
 		response.ContentLength = int64(len(data))
 	}
 
-	if strings.Contains(input.URL, "init.itunes.apple.com/bag.xml") && response.StatusCode == http.StatusOK {
-		data, e := io.ReadAll(response.Body)
-		_ = response.Body.Close()
-
-		if e != nil {
-			return nil, fmt.Errorf("read Store response: %w", e)
-		}
-
-		response.Body = io.NopCloser(bytes.NewReader(data))
-
-		var values map[string]any
-		if e = apphttp.DecodePropertyList(data, &values); e == nil {
-			b.mu.Lock()
-			b.bag = values
-			b.mu.Unlock()
-		}
-	}
-
 	return response, nil
+}
+
+func (b *Backend) cachedBag(guid string) map[string]any {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.bagGUID != strings.ToUpper(guid) {
+		return nil
+	}
+	return b.bag
+}
+
+func (b *Backend) cachedBagBytes(guid, requestURL string) []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.bagGUID != strings.ToUpper(guid) || b.bagURL != requestURL || len(b.bagRaw) == 0 {
+		return nil
+	}
+	return b.bagRaw
+}
+
+func (b *Backend) rememberBag(guid, requestURL string, response *http.Response) (*http.Response, error) {
+	const maxBagSize = 32 << 20
+	data, err := io.ReadAll(io.LimitReader(response.Body, maxBagSize+1))
+	_ = response.Body.Close()
+	if err != nil {
+		return nil, fmt.Errorf("read Store bag response: %w", err)
+	}
+	if len(data) > maxBagSize {
+		return nil, errors.New("Store bag response exceeds size limit")
+	}
+	response.Body = io.NopCloser(bytes.NewReader(data))
+
+	var values map[string]any
+	if err := apphttp.DecodePropertyList(data, &values); err == nil && len(values) > 0 && guid != "" {
+		b.mu.Lock()
+		b.bag, b.bagRaw, b.bagGUID, b.bagURL = values, data, strings.ToUpper(guid), requestURL
+		b.mu.Unlock()
+	}
+	return response, nil
+}
+
+func (b *Backend) fetchPurchaseBag(ctx context.Context, guid, userAgent string) (map[string]any, error) {
+	response, err := b.Client("bag-direct").Send(apphttp.Request{
+		Context: ctx,
+		URL:     "https://init.itunes.apple.com/bag.xml?ix=6&guid=" + url.QueryEscape(guid),
+		Method:  http.MethodGet,
+		Timeout: apphttp.DefaultAuthenticationTimeout,
+		Headers: map[string]string{"Accept": "application/xml", "User-Agent": userAgent},
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Store bag returned HTTP %d", response.StatusCode)
+	}
+	if bag := b.cachedBag(guid); bag != nil {
+		return bag, nil
+	}
+	return nil, errors.New("invalid Store bag")
+}
+
+// ClearBag drops the in-memory bag cache when credentials are revoked.
+func (b *Backend) ClearBag() {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	b.bag, b.bagRaw, b.bagGUID, b.bagURL = nil, nil, "", ""
+	b.mu.Unlock()
 }
 
 // CloseIdleConnections releases pooled sockets without interrupting active streams.

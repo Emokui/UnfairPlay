@@ -202,8 +202,9 @@ func (t *appstore) replicateZip(src *zip.ReadCloser, dst *zip.Writer, sourcePath
 		return fmt.Errorf("failed to read zip directory: %w", err)
 	}
 
+	buffer := make([]byte, 128<<10)
 	for _, file := range src.File {
-		localExtra, err := headers.extra(file)
+		entry, err := headers.entry(file)
 		if err != nil {
 			return fmt.Errorf("failed to read local metadata for %q: %w", file.Name, err)
 		}
@@ -211,14 +212,16 @@ func (t *appstore) replicateZip(src *zip.ReadCloser, dst *zip.Writer, sourcePath
 		if len(replacing) > 0 && replacing[0][file.Name] {
 			continue
 		}
-		srcFile, err := file.OpenRaw()
-		if err != nil {
-			return fmt.Errorf("failed to open file: %w", err)
+		if entry.dataOffset < 0 || entry.dataOffset > info.Size() || file.CompressedSize64 > uint64(info.Size()-entry.dataOffset) {
+			return zip.ErrFormat
 		}
+
+		size := int64(file.CompressedSize64)
+		srcFile := io.NewSectionReader(source, entry.dataOffset, size)
 
 		header := file.FileHeader
 
-		header.Extra = zipStoredExtra(&header, localExtra)
+		header.Extra = zipStoredExtra(&header, entry.extra)
 		// Frame deflated files with a trailing descriptor for streaming
 		// installers, without changing their compressed data or timestamps.
 		// Stored files need inline sizes because they have no stream terminator.
@@ -237,9 +240,12 @@ func (t *appstore) replicateZip(src *zip.ReadCloser, dst *zip.Writer, sourcePath
 		// for the central directory written by Close. Keep the two extras distinct.
 		header.Extra = zipExtraWithoutZIP64(file.Extra)
 
-		_, err = io.Copy(dstFile, srcFile)
+		copied, err := io.CopyBuffer(dstFile, srcFile, buffer)
 		if err != nil {
 			return fmt.Errorf("failed to copy file: %w", err)
+		}
+		if copied != size {
+			return fmt.Errorf("failed to copy file: %w", io.ErrUnexpectedEOF)
 		}
 	}
 

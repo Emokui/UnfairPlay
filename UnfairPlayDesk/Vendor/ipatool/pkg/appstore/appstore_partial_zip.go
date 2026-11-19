@@ -3,6 +3,7 @@ package appstore
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -32,32 +33,46 @@ type versionMetadata struct {
 }
 
 type httpRangeReaderAt struct {
+	ctx    context.Context
 	client apphttp.Client[interface{}]
 	url    string
 	size   int64
 }
 
 func newHTTPRangeReaderAt(client apphttp.Client[interface{}], url string) (*httpRangeReaderAt, int64, error) {
-	if url == "" {
+	return newHTTPRangeReaderAtContext(context.Background(), client, url)
+}
+
+func newHTTPRangeReaderAtContext(ctx context.Context, client apphttp.Client[interface{}], url string) (*httpRangeReaderAt, int64, error) {
+	if ctx != nil && ctx.Err() != nil {
+		return nil, 0, ctx.Err()
+	}
+
+	if strings.TrimSpace(url) == "" {
 		return nil, 0, errors.New("url is empty")
 	}
 
-	size, err := remoteFileSize(client, url)
+	size, err := remoteFileSize(ctx, client, url)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to read remote file size: %w", err)
 	}
 
 	return &httpRangeReaderAt{
+		ctx:    ctx,
 		client: client,
 		url:    url,
 		size:   size,
 	}, size, nil
 }
 
-func remoteFileSize(client apphttp.Client[interface{}], url string) (int64, error) {
+func remoteFileSize(ctx context.Context, client apphttp.Client[interface{}], url string) (int64, error) {
 	req, err := client.NewRequest("GET", url, nil)
 	if err != nil {
 		return 0, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	if ctx != nil && req != nil {
+		req = req.WithContext(ctx)
 	}
 
 	req.Header.Set("Accept-Encoding", "identity")
@@ -108,6 +123,10 @@ func parseContentRangeSize(header string) (int64, error) {
 }
 
 func (r *httpRangeReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	if r.ctx != nil && r.ctx.Err() != nil {
+		return 0, r.ctx.Err()
+	}
+
 	if len(p) == 0 {
 		return 0, nil
 	}
@@ -130,6 +149,10 @@ func (r *httpRangeReaderAt) ReadAt(p []byte, off int64) (int, error) {
 	req, err := r.client.NewRequest("GET", r.url, nil)
 	if err != nil {
 		return 0, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	if r.ctx != nil && req != nil {
+		req = req.WithContext(r.ctx)
 	}
 
 	req.Header.Set("Accept-Encoding", "identity")
@@ -167,7 +190,11 @@ func (r *httpRangeReaderAt) ReadAt(p []byte, off int64) (int, error) {
 }
 
 func (t *appstore) readVersionMetadataFromIPA(url string) (versionMetadata, error) {
-	reader, size, err := newHTTPRangeReaderAt(t.httpClient, url)
+	return t.readVersionMetadataFromIPAContext(context.Background(), url)
+}
+
+func (t *appstore) readVersionMetadataFromIPAContext(ctx context.Context, url string) (versionMetadata, error) {
+	reader, size, err := newHTTPRangeReaderAtContext(ctx, t.httpClient, url)
 	if err != nil {
 		return versionMetadata{}, err
 	}

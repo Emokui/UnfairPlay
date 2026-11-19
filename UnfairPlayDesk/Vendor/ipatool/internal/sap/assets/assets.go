@@ -13,6 +13,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
+	"sync"
 	"time"
 
 	"github.com/majd/ipatool/v2/internal/sap/machimage"
@@ -34,6 +36,38 @@ type Bundle struct {
 	CoreFPICXS         []byte
 	FairPlayD          []byte
 	FairPlayKext       []byte
+	verifiedPtrs       [7]*byte
+}
+
+// VerifiedDigest returns the pinned SHA-256 digest when data is the exact
+// slice verified by the asset loader.
+func (b Bundle) VerifiedDigest(name string, data []byte) ([32]byte, bool) {
+	if len(data) == 0 {
+		return [32]byte{}, false
+	}
+
+	for index, spec := range requiredFiles {
+		if spec.name == name {
+			if len(data) == spec.size && b.verifiedPtrs[index] == &data[0] {
+				return spec.digest, true
+			}
+
+			return [32]byte{}, false
+		}
+	}
+
+	return [32]byte{}, false
+}
+
+func markBundleVerified(bundle Bundle) Bundle {
+	files := bundleFiles(bundle)
+	for index, spec := range requiredFiles {
+		if data := files[spec.name]; len(data) == spec.size && len(data) > 0 {
+			bundle.verifiedPtrs[index] = &data[0]
+		}
+	}
+
+	return bundle
 }
 
 type fileSpec struct {
@@ -173,7 +207,7 @@ func loadBundle(ctx context.Context) (Bundle, error) {
 		return Bundle{}, fmt.Errorf("cache Apple SAP assets: %w", err)
 	}
 
-	return bundle, nil
+	return markBundleVerified(bundle), nil
 }
 
 // Keep only the architecture used by the emulator after verifying and caching
@@ -243,25 +277,66 @@ func loadCachedBundle(directory string) (Bundle, bool) {
 	// smaller representation when possible without requiring a new download.
 	_ = writeCache(directory, bundle)
 
-	return bundle, true
+	return markBundleVerified(bundle), true
 }
 
 func readCache(directory string) (Bundle, error) {
-	return readCacheSpecs(directory, requiredFiles)
+	bundle, err := readCacheSpecs(directory, requiredFiles)
+	if err != nil {
+		return Bundle{}, err
+	}
+
+	return markBundleVerified(bundle), nil
 }
 
 func readCacheSpecs(directory string, specs []fileSpec) (Bundle, error) {
-	files := make(map[string][]byte, len(specs))
-
-	for _, spec := range specs {
-		data, err := readCacheData(filepath.Join(directory, spec.name), spec.size, &spec)
-		if err != nil {
-			return Bundle{}, fmt.Errorf("read cached Apple SAP asset %s: %w", spec.name, err)
+	type assetRead struct {
+		data []byte
+		err  error
+	}
+	reads := make([]assetRead, len(specs))
+	// Distribute the largest assets first by total bytes assigned.
+	order := make([]int, len(specs))
+	for index := range specs {
+		order[index] = index
+	}
+	sort.SliceStable(order, func(a, b int) bool { return specs[order[a]].size > specs[order[b]].size })
+	var assignments [2][]int
+	var totals [2]int
+	for _, index := range order {
+		worker := 0
+		if totals[1] < totals[0] {
+			worker = 1
 		}
-
-		files[spec.name] = data
+		assignments[worker] = append(assignments[worker], index)
+		totals[worker] += specs[index].size
 	}
 
+	var pending sync.WaitGroup
+	for _, indices := range assignments {
+		if len(indices) == 0 {
+			continue
+		}
+		pending.Go(func() {
+			for _, index := range indices {
+				spec := specs[index]
+				data, err := readCacheData(filepath.Join(directory, spec.name), spec.size, &spec)
+				reads[index] = assetRead{data: data, err: err}
+				if err != nil {
+					return
+				}
+			}
+		})
+	}
+	pending.Wait()
+
+	files := make(map[string][]byte, len(specs))
+	for index, spec := range specs {
+		if err := reads[index].err; err != nil {
+			return Bundle{}, fmt.Errorf("read cached Apple SAP asset %s: %w", spec.name, err)
+		}
+		files[spec.name] = reads[index].data
+	}
 	return bundleFrom(files), nil
 }
 

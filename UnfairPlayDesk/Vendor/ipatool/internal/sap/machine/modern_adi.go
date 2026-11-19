@@ -43,25 +43,38 @@ type ModernADI struct {
 }
 
 func OpenModernADI(ctx context.Context, bundle assets.Bundle, identifier, state []byte) (*ModernADI, error) {
+	return openModernADI(ctx, bundle, identifier, state, true)
+}
+
+// OpenModernADIService opens the daemons required for callers that send XPC
+// requests themselves, without loading the commerce client.
+func OpenModernADIService(ctx context.Context, bundle assets.Bundle, identifier, state []byte) (*ModernADI, error) {
+	return openModernADI(ctx, bundle, identifier, state, false)
+}
+
+func openModernADI(ctx context.Context, bundle assets.Bundle, identifier, state []byte, commerce bool) (*ModernADI, error) {
 	if len(identifier) != 16 {
 		return nil, errors.New("modern ADI host UUID must be 16 bytes")
 	}
 
-	runtime, _, err := openRuntime(ctx, bundle, runtimeOptions{
-		extraImages: []imageSpec{{name: "commerce", data: bundle.Commerce, base: storeAgentBase}},
-		shims:       shimOptions{zeroReturnAliases: storeAgentZeroReturnAliases},
-	})
-	if err != nil {
-		return nil, err
-	}
-
+	var runtime *Machine
 	ready := false
-
-	defer func() {
-		if !ready {
-			_ = runtime.Close()
+	if commerce {
+		client, _, err := openRuntime(ctx, bundle, runtimeOptions{
+			extraImages: []imageSpec{{name: "commerce", data: bundle.Commerce, base: storeAgentBase}},
+			shims:       shimOptions{zeroReturnAliases: storeAgentZeroReturnAliases},
+		})
+		if err != nil {
+			return nil, err
 		}
-	}()
+		runtime = client
+		copy(runtime.services.hostUUID[:], identifier)
+		defer func() {
+			if !ready {
+				_ = runtime.Close()
+			}
+		}()
+	}
 
 	daemon, _, err := openRuntime(ctx, bundle, runtimeOptions{
 		extraImages: []imageSpec{{name: "adid", data: bundle.ADID, base: modernADIDBase}},
@@ -90,7 +103,6 @@ func OpenModernADI(ctx context.Context, bundle assets.Bundle, identifier, state 
 			_ = fairplay.Close()
 		}
 	}()
-	copy(runtime.services.hostUUID[:], identifier)
 	copy(daemon.services.hostUUID[:], identifier)
 	copy(fairplay.services.hostUUID[:], identifier)
 
@@ -132,7 +144,9 @@ func OpenModernADI(ctx context.Context, bundle assets.Bundle, identifier, state 
 	}
 
 	daemon.services.fairPlayHandler = adi.handleFairPlayMessage
-	runtime.services.fairPlayHandler = adi.handleFairPlayMessage
+	if runtime != nil {
+		runtime.services.fairPlayHandler = adi.handleFairPlayMessage
+	}
 
 	if err := adi.initializeDaemon(); err != nil {
 		return nil, err
@@ -613,7 +627,7 @@ func (a *ModernADI) readOutput(pointerField, lengthField uint64) ([]byte, error)
 }
 
 func (a *ModernADI) State() ([]byte, error) {
-	if a == nil || a.runtime == nil {
+	if a == nil || a.daemon == nil {
 		return nil, errors.New("modern ADI runtime is unavailable")
 	}
 
@@ -631,13 +645,13 @@ func (a *ModernADI) State() ([]byte, error) {
 }
 
 func (a *ModernADI) Close() error {
-	if a == nil || a.runtime == nil {
+	if a == nil || a.daemon == nil {
 		return nil
 	}
 
 	var err error
 
-	if a.storeGlobal != 0 {
+	if a.runtime != nil && a.storeGlobal != 0 {
 		if status, closeErr := a.runtime.invoke(storeAgentGlobalClose, uint64(a.storeGlobal)); closeErr != nil {
 			err = errors.Join(err, fmt.Errorf("close FairPlay keybag context: %w", closeErr))
 		} else if int32(status) != 0 {
@@ -645,7 +659,9 @@ func (a *ModernADI) Close() error {
 		}
 	}
 
-	err = errors.Join(err, a.runtime.Close())
+	if a.runtime != nil {
+		err = errors.Join(err, a.runtime.Close())
+	}
 	err = errors.Join(err, a.daemon.Close())
 	err = errors.Join(err, a.fairplay.Close())
 

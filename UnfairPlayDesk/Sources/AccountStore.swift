@@ -12,6 +12,10 @@ struct Profile: Codable, Identifiable, Hashable {
     var loginCleared: Bool?
 }
 
+enum ModelCheckState: Equatable {
+    case checking, valid, invalid
+}
+
 final class Store: ObservableObject {
     @Published var profiles: [Profile] = []
     @Published var selected: UUID? {
@@ -19,14 +23,16 @@ final class Store: ObservableObject {
     }
     @Published var error: String?
     @Published var storageReady = false
+    @Published private(set) var modelCheckStates: [UUID: ModelCheckState] = [:]
+    @Published private(set) var modelSelectors: [UUID: Set<String>] = [:]
     @Published var modelReady = false
     @Published var modelMessage = "尚未选择账户"
     @Published var unresolvedReports = 0
     let root: URL
     let modelTool: URL?
     private var snapshot: Data?
-    private var modelCache: [UUID: (stamp: [String: Core.FileStamp]?, result: (Bool, String))] = [:]
-    private var checks: Set<UUID> = []
+    private var modelCache: [UUID: (stamp: [String: Core.FileStamp]?, result: (Bool, String), selectors: Set<String>)] = [:]
+    private(set) var checks: Set<UUID> = []
     private var diagnosticRunners: [UUID: Runner] = [:]
     private var versions: [UUID: Int] = [:]
     private var lockHandle: FileHandle?
@@ -109,6 +115,12 @@ final class Store: ObservableObject {
         guard profiles[index] != previous else { return }
         do { try save() } catch { profiles[index] = previous; throw error }
     }
+    @discardableResult
+    func bindRefreshedSession(_ id: UUID, in output: String) throws -> Bool {
+        guard let refreshed = Core.refreshedSession(in: output) else { return false }
+        try bindIdentity(id, email: refreshed.email, storeFront: refreshed.storeFront)
+        return true
+    }
     func markLoginCleared(_ id: UUID) throws {
         guard let index = profiles.firstIndex(where: { $0.id == id }) else { return }
         let previous = profiles[index]
@@ -121,14 +133,21 @@ final class Store: ObservableObject {
         let previous = profiles[index]
         profiles[index].deletionPending = true
         do { try save() } catch { profiles[index] = previous; throw error }
+        versions[id, default: 0] += 1
+        modelCache.removeValue(forKey: id)
+        modelSelectors.removeValue(forKey: id)
+        modelCheckStates.removeValue(forKey: id)
         diagnosticRunners[id]?.stop()
-        refreshModel(force: true)
+        if selected == id { modelReady = false; modelMessage = "删除尚未完成，请继续删除此档案" }
     }
     func remove(_ account: Profile) throws {
         let previous = profiles
         profiles.removeAll { $0.id == account.id }
         do { try save() } catch { profiles = previous; throw error }
+        versions.removeValue(forKey: account.id)
         modelCache.removeValue(forKey: account.id)
+        modelSelectors.removeValue(forKey: account.id)
+        modelCheckStates.removeValue(forKey: account.id)
         if selected == account.id { selected = profiles.first?.id }
         refreshLegacyCount()
     }
@@ -140,14 +159,33 @@ final class Store: ObservableObject {
         try Core.installModels(source, to: dest)
         refreshModel(force: true)
     }
-    func refreshModel(force: Bool = false) {
-        guard let id = selected, canUseSelected, let directory = profileURL else {
-            modelReady = false; modelMessage = selectedProfile?.deletionPending == true ? "删除尚未完成，请继续删除此档案" : "尚未选择可用账户"; return
+    func refreshAllModels() {
+        for profile in profiles where profile.deletionPending != true {
+            refreshModel(accountID: profile.id)
         }
+    }
+    func refreshModel(accountID: UUID? = nil, force: Bool = false) {
+        guard let id = accountID ?? selected, storageReady,
+              profiles.contains(where: { $0.id == id && $0.deletionPending != true }) else {
+            if accountID == nil {
+                modelReady = false
+                modelMessage = selectedProfile?.deletionPending == true ? "删除尚未完成，请继续删除此档案" : "尚未选择可用账户"
+            }
+            return
+        }
+        let directory = root.appendingPathComponent("Models/\(id.uuidString)")
         if force { modelCache.removeValue(forKey: id); versions[id, default: 0] += 1 }
         let stamp = try? Core.modelStamp(directory)
-        if let cached = modelCache[id], cached.stamp == stamp { modelReady = cached.result.0; modelMessage = cached.result.1; return }
-        modelReady = false; modelMessage = "正在校验模型…"
+        if let cached = modelCache[id], cached.stamp == stamp {
+            let state: ModelCheckState = cached.result.0 ? .valid : .invalid
+            if modelCheckStates[id] != state { modelCheckStates[id] = state }
+            if modelSelectors[id] != cached.selectors { modelSelectors[id] = cached.selectors }
+            if id == selected { modelReady = cached.result.0; modelMessage = cached.result.1 }
+            return
+        }
+        if modelCheckStates[id] != .checking { modelCheckStates[id] = .checking }
+        if modelSelectors[id] != nil { modelSelectors.removeValue(forKey: id) }
+        if id == selected { modelReady = false; modelMessage = "正在校验模型…" }
         guard !checks.contains(id) else { return }
         checks.insert(id)
         let version = versions[id, default: 0]
@@ -158,6 +196,11 @@ final class Store: ObservableObject {
                 return
             }
             DispatchQueue.main.async {
+                guard self.profiles.contains(where: { $0.id == id && $0.deletionPending != true }),
+                      self.versions[id, default: 0] == version else {
+                    self.finishCheck(id, version: version, stamp: stamp, result: (false, "模型校验已失效"))
+                    return
+                }
                 guard let tool = self.modelTool else { self.finishCheck(id, version: version, stamp: stamp, result: (false, "缺少模型校验工具")); return }
                 let runner = Runner()
                 runner.background = true
@@ -166,18 +209,23 @@ final class Store: ObservableObject {
                     let data = runner.output.data(using: .utf8) ?? Data()
                     let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
                     let valid = ok && (json?["checks"] as? [String: Any])?["model_valid"] as? Bool == true
-                    self.finishCheck(id, version: version, stamp: stamp, result: (valid, valid ? "模型已校验，可用于解密" : "模型校验失败，请检查格式、权限或重新初始化"))
+                    let selectors = valid ? Set(json?["selector_ids"] as? [String] ?? []) : []
+                    self.finishCheck(id, version: version, stamp: stamp,
+                                     result: (valid, valid ? "模型已校验，可用于解密" : "模型校验失败，请检查格式、权限或重新初始化"), selectors: selectors)
                 }
             }
         }
     }
-    private func finishCheck(_ id: UUID, version: Int, stamp: [String: Core.FileStamp]?, result: (Bool, String)) {
+    private func finishCheck(_ id: UUID, version: Int, stamp: [String: Core.FileStamp]?, result: (Bool, String), selectors: Set<String> = []) {
         checks.remove(id)
         diagnosticRunners.removeValue(forKey: id)
-        guard versions[id, default: 0] == version else { if selected == id { refreshModel() }; return }
+        guard profiles.contains(where: { $0.id == id && $0.deletionPending != true }) else { return }
+        guard versions[id, default: 0] == version else { refreshModel(accountID: id); return }
         let directory = root.appendingPathComponent("Models/\(id.uuidString)")
-        guard (try? Core.modelStamp(directory)) == stamp else { if selected == id { refreshModel() }; return }
-        modelCache[id] = (stamp, result)
+        guard (try? Core.modelStamp(directory)) == stamp else { refreshModel(accountID: id); return }
+        modelCache[id] = (stamp, result, selectors)
+        modelCheckStates[id] = result.0 ? .valid : .invalid
+        modelSelectors[id] = selectors
         if selected == id {
             modelReady = canUseSelected && result.0
             modelMessage = canUseSelected ? result.1 : "删除尚未完成，请继续删除此档案"

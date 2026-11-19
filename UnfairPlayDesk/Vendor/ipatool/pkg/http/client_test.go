@@ -74,6 +74,20 @@ var _ = Describe("Typed response client", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(payload.Content).To(Equal([]byte{0, 1, 255}))
 	})
+	It("preserves a header-only Store provisioning action", func() {
+		client := NewClient[result](Args{Authentication: true, Executor: testExecutor{send: func(Request, []byte) (*gohttp.Response, error) {
+			res := response("")
+			res.StatusCode = gohttp.StatusNoContent
+			res.Header.Set("X-Apple-AMD-Action", "SP")
+			res.Header.Set("X-Apple-AMD-Data", "synthetic-challenge")
+			return res, nil
+		}}})
+
+		got, err := client.Send(Request{ResponseFormat: ResponseFormatXML})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(got.GetHeader("X-Apple-AMD-Action")).To(Equal("SP"))
+		Expect(got.GetHeader("X-Apple-AMD-Data")).To(Equal("synthetic-challenge"))
+	})
 	DescribeTable("forwards configured timeouts", func(args Args, want time.Duration) {
 		args.Executor = testExecutor{send: func(req Request, _ []byte) (*gohttp.Response, error) {
 			Expect(req.Timeout).To(Equal(want))

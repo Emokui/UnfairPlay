@@ -2,10 +2,12 @@ package appstore
 
 import (
 	"archive/zip"
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	gohttp "net/http"
 	"os"
@@ -133,6 +135,9 @@ func (t *appstore) Download(input DownloadInput) (DownloadOutput, error) {
 	}
 
 	item := res.Data.Items[0]
+	if res.StatusCode == gohttp.StatusOK && strings.TrimSpace(item.URL) == "" {
+		return DownloadOutput{}, errors.New("download response has no package URL")
+	}
 
 	version := "unknown"
 
@@ -155,37 +160,26 @@ func (t *appstore) Download(input DownloadInput) (DownloadOutput, error) {
 		return t.downloadMacPackage(input.Context, item, destination, machineGUID, input.Progress)
 	}
 
+	var artworkReady chan artworkResult
+	if item.ArtworkURL != "" {
+		artworkCtx, cancel := context.WithCancel(input.Context)
+		defer cancel()
+		artworkReady = make(chan artworkResult, 1)
+		go func() {
+			data, err := t.downloadArtwork(artworkCtx, item.ArtworkURL)
+			artworkReady <- artworkResult{data: data, err: err}
+		}()
+	}
+
 	stage("正在下载 IPA")
 	tmpPath := fmt.Sprintf("%s.tmp", destination)
-
 	if err := t.downloadFile(input.Context, item.URL, tmpPath, input.Progress); err != nil {
 		return DownloadOutput{}, fmt.Errorf("failed to download file: %w", err)
 	}
 
-	stage("正在检查下载包")
-	if err := t.validatePackagePlatform(tmpPath, resolvedPlatform); err != nil {
-		if removeErr := t.os.Remove(tmpPath); removeErr != nil {
-			err = errors.Join(err, fmt.Errorf("failed to remove invalid package: %w", removeErr))
-		}
-
-		return DownloadOutput{}, fmt.Errorf("failed to validate package platform: %w", err)
+	if err := t.finishDownloadedIPA(input, item, resolvedPlatform, tmpPath, destination, artworkReady); err != nil {
+		return DownloadOutput{}, err
 	}
-
-	stage("正在获取应用图标")
-	artwork, err := t.downloadArtwork(input.Context, item.ArtworkURL)
-	if err != nil {
-		return DownloadOutput{}, fmt.Errorf("failed to download artwork: %w", err)
-	}
-
-	stage("正在整理 IPA 与应用许可")
-	if err := t.applyPatches(item, input.Account, tmpPath, destination, artwork, input.OmitUpdateMetadata); err != nil {
-		return DownloadOutput{}, fmt.Errorf("failed to apply patches: %w", err)
-	}
-
-	if err := t.os.Remove(tmpPath); err != nil {
-		return DownloadOutput{}, fmt.Errorf("failed to remove file: %w", err)
-	}
-
 	stage("IPA 整理完成")
 	return DownloadOutput{
 		SinfReplicated:  true,
@@ -194,31 +188,94 @@ func (t *appstore) Download(input DownloadInput) (DownloadOutput, error) {
 	}, nil
 }
 
+type artworkResult struct {
+	data []byte
+	err  error
+}
+
+// Only complete transfers enter finalization. Partial files remain available
+// for a later resume when the transfer itself fails.
+func (t *appstore) finishDownloadedIPA(input DownloadInput, item downloadItemResult, platform Platform, tmpPath, destination string, artworkReady <-chan artworkResult) (err error) {
+	defer func() {
+		if removeErr := t.os.Remove(tmpPath); removeErr != nil && !os.IsNotExist(removeErr) {
+			err = joinCleanupError(err, "failed to remove downloaded temporary IPA", removeErr)
+		}
+	}()
+
+	reportDownloadStage(input.Context, "正在检查下载包")
+	srcZip, err := zip.OpenReader(tmpPath)
+	if srcZip != nil {
+		defer func() {
+			if closeErr := srcZip.Close(); closeErr != nil {
+				err = joinCleanupError(err, "failed to close source IPA", closeErr)
+			}
+		}()
+	}
+	if err == nil {
+		err = validatePackageContents(&srcZip.Reader, packagePlatformName(platform))
+	}
+	if err != nil {
+		return fmt.Errorf("failed to validate package platform: %w", err)
+	}
+
+	var artwork []byte
+	if artworkReady != nil {
+		reportDownloadStage(input.Context, "正在获取应用图标")
+		result := <-artworkReady
+		if result.err == nil {
+			artwork = result.data
+		} else {
+			reportDownloadStage(input.Context, "应用图标暂不可用，继续整理 IPA")
+		}
+	}
+
+	if input.Context != nil && input.Context.Err() != nil {
+		return input.Context.Err()
+	}
+	reportDownloadStage(input.Context, "正在整理 IPA 与应用许可")
+	if err := t.writePatches(item, input.Account, srcZip, tmpPath, destination, artwork, input.OmitUpdateMetadata); err != nil {
+		return fmt.Errorf("failed to apply patches: %w", err)
+	}
+	return nil
+}
+
 type platformPackageInfo struct {
 	SupportedPlatforms []string `plist:"CFBundleSupportedPlatforms,omitempty"`
 }
 
-func (*appstore) validatePackagePlatform(path string, platform Platform) error {
-	var expectedPlatform string
-
+func packagePlatformName(platform Platform) string {
 	switch platform {
 	case PlatformIPhone, PlatformIPad:
-		expectedPlatform = "iPhoneOS"
+		return "iPhoneOS"
 	case PlatformAppleTV:
-		expectedPlatform = "AppleTVOS"
+		return "AppleTVOS"
 	case PlatformWatchOS:
-		expectedPlatform = "WatchOS"
+		return "WatchOS"
 	case PlatformVisionOS:
-		expectedPlatform = "XROS"
+		return "XROS"
 	default:
+		return ""
+	}
+}
+
+func (*appstore) validatePackagePlatform(path string, platform Platform) error {
+	expected := packagePlatformName(platform)
+	if expected == "" {
 		return nil
 	}
-
 	reader, err := zip.OpenReader(path)
 	if err != nil {
 		return fmt.Errorf("failed to open zip reader: %w", err)
 	}
 	defer reader.Close()
+
+	return validatePackageContents(&reader.Reader, expected)
+}
+
+func validatePackageContents(reader *zip.Reader, expectedPlatform string) error {
+	if expectedPlatform == "" {
+		return nil
+	}
 
 	for _, file := range reader.File {
 		if !isTopLevelAppInfoPlist(file.Name) {
@@ -382,7 +439,8 @@ func (t *appstore) downloadFileAttempt(ctx context.Context, src, dst string, pro
 		return fmt.Errorf("can not seek file: %w", err)
 	}
 
-	var writer io.Writer = file
+	buffered := bufio.NewWriterSize(file, 128<<10)
+	var writer io.Writer = struct{ io.Writer }{buffered}
 
 	if progress != nil {
 		progress.ChangeMax64(total)
@@ -391,7 +449,7 @@ func (t *appstore) downloadFileAttempt(ctx context.Context, src, dst string, pro
 			return fmt.Errorf("can not set bar progress: %w", err)
 		}
 
-		writer = io.MultiWriter(file, progress)
+		writer = io.MultiWriter(buffered, progress)
 	}
 
 	var body io.Reader = downloadBodyReader{res.Body}
@@ -399,9 +457,14 @@ func (t *appstore) downloadFileAttempt(ctx context.Context, src, dst string, pro
 		body = io.LimitReader(body, remaining)
 	}
 
-	written, err := io.Copy(writer, body)
-	if err != nil {
-		return fmt.Errorf("failed to write file: %w", err)
+	written, copyErr := io.Copy(writer, body)
+	// Commit received bytes even when the response is interrupted, so the next
+	// request starts at the bytes actually written to the temporary file.
+	if flushErr := buffered.Flush(); flushErr != nil {
+		return fmt.Errorf("failed to flush downloaded file: %w", flushErr)
+	}
+	if copyErr != nil {
+		return fmt.Errorf("failed to write file: %w", copyErr)
 	}
 
 	if remaining >= 0 && written != remaining || total >= 0 && offset+written != total {
@@ -483,6 +546,10 @@ func (t *appstore) applyPatches(item downloadItemResult, acc Account, src, dst s
 	}
 	defer srcZip.Close()
 
+	return t.writePatches(item, acc, srcZip, src, dst, artwork, omitUpdateMetadata)
+}
+
+func (t *appstore) writePatches(item downloadItemResult, acc Account, srcZip *zip.ReadCloser, src, dst string, artwork []byte, omitUpdateMetadata bool) (err error) {
 	dstFile, err := t.os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
 		return fmt.Errorf("failed to open file: %w", err)
@@ -539,15 +606,17 @@ func (t *appstore) applyPatches(item downloadItemResult, acc Account, src, dst s
 }
 
 func (t *appstore) writeMetadata(metadata map[string]interface{}, acc Account, zip *zip.Writer) error {
-	metadata["apple-id"] = acc.Email
-	metadata["userName"] = acc.Email
+	patched := make(map[string]interface{}, len(metadata)+2)
+	maps.Copy(patched, metadata)
+	patched["apple-id"] = acc.Email
+	patched["userName"] = acc.Email
 
 	metadataFile, err := zip.Create("iTunesMetadata.plist")
 	if err != nil {
 		return fmt.Errorf("failed to create file: %w", err)
 	}
 
-	data, err := plist.Marshal(metadata, plist.BinaryFormat)
+	data, err := plist.Marshal(patched, plist.BinaryFormat)
 	if err != nil {
 		return fmt.Errorf("failed to marshal data: %w", err)
 	}

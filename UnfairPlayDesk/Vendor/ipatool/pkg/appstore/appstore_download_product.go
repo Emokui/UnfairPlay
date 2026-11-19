@@ -62,16 +62,14 @@ func (t *appstore) sendDownloadProduct(ctx context.Context, acc Account, app App
 			bag = &fetched
 			if bag.EntDownloadEndpoint != "" {
 				res, resolvedPlatform, err := t.sendPreferredDownload(ctx, bag.EntDownloadEndpoint, acc, app, guid, externalVersionID, platform)
-				if err == nil {
-					return res, resolvedPlatform, nil
-				}
-				if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+				if err == nil || errors.Is(err, ErrStoreAMDNotProvisioned) {
 					return res, resolvedPlatform, err
 				}
 			}
 		}
 	}
 
+	// An individual request can time out while the overall ticket budget is still live.
 	if err := ctx.Err(); err != nil {
 		return http.Result[downloadResult]{}, platform, fmt.Errorf("download request canceled: %w", err)
 	}
@@ -85,6 +83,10 @@ func (t *appstore) sendDownloadProduct(ctx context.Context, acc Account, app App
 	}
 
 	if !isEmptyDownloadProductResponse(res) && !isUnavailableDownloadProductResponse(res) {
+		if err := validateCommerceDownloadResponse(res, app, externalVersionID, "volumeStore"); err != nil {
+			return res, platform, err
+		}
+
 		return res, platform, nil
 	}
 
@@ -145,6 +147,10 @@ func (t *appstore) sendDownloadProduct(ctx context.Context, acc Account, app App
 
 	if err != nil {
 		return redownloadRes, platform, fmt.Errorf("failed to send redownload request: %w", err)
+	}
+
+	if err := validateCommerceDownloadResponse(redownloadRes, app, externalVersionID, "redownload"); err != nil {
+		return redownloadRes, platform, err
 	}
 
 	return redownloadRes, platform, nil
@@ -255,6 +261,54 @@ func validateDownloadResponse(res http.Result[downloadResult], app App, external
 	bundleID, ok := metadata["softwareVersionBundleId"].(string)
 	if !ok || bundleID == "" || (app.BundleID != "" && bundleID != app.BundleID) {
 		return fmt.Errorf("%s response does not match the requested bundle identifier", source)
+	}
+
+	return nil
+}
+
+// validateCommerceDownloadResponse validates item count, status, error text, and
+// present app/version/bundle identifiers on volumeStore and versioned redownload
+// responses while letting callers handle empty or structured-failure payloads.
+func validateCommerceDownloadResponse(res http.Result[downloadResult], app App, externalVersionID, source string) error {
+	if res.Data.FailureType != "" || len(res.Data.Items) == 0 {
+		return nil
+	}
+
+	if res.Data.CustomerMessage != "" {
+		return NewErrorWithMetadata(fmt.Errorf("received %s error: %s", source, res.Data.CustomerMessage), res)
+	}
+
+	if res.StatusCode != 0 && res.StatusCode != gohttp.StatusOK {
+		return fmt.Errorf("received unexpected %s status code: %d", source, res.StatusCode)
+	}
+
+	if len(res.Data.Items) != 1 {
+		return fmt.Errorf("%s response must contain exactly one item", source)
+	}
+
+	metadata := res.Data.Items[0].Metadata
+	rawItemID, hasItemID := metadata["itemId"]
+	if hasItemID && (rawItemID == nil || fmt.Sprint(rawItemID) != fmt.Sprint(app.ID)) {
+		return fmt.Errorf("%s response does not match the requested app or version", source)
+	}
+
+	rawBundleID, hasBundleID := metadata["softwareVersionBundleId"]
+	if externalVersionID != "" {
+		rawVersionID, hasVersionID := metadata["softwareVersionExternalIdentifier"]
+		if hasVersionID && (rawVersionID == nil || fmt.Sprint(rawVersionID) != externalVersionID) {
+			return fmt.Errorf("%s response does not match the requested app or version", source)
+		}
+
+		if !hasVersionID && hasItemID && hasBundleID {
+			return fmt.Errorf("%s response does not match the requested app or version", source)
+		}
+	}
+
+	if hasBundleID {
+		bundleID, isString := rawBundleID.(string)
+		if !isString || bundleID == "" || (app.BundleID != "" && bundleID != app.BundleID) {
+			return fmt.Errorf("%s response does not match the requested bundle identifier", source)
+		}
 	}
 
 	return nil

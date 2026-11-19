@@ -1,6 +1,10 @@
 package cmd
 
 import (
+	"bytes"
+	"context"
+	"fmt"
+
 	"github.com/majd/ipatool/v2/pkg/appstore"
 	"github.com/majd/ipatool/v2/pkg/log"
 	. "github.com/onsi/ginkgo/v2"
@@ -75,20 +79,59 @@ var _ = Describe("Purchase command", func() {
 		Expect(store.purchaseInput.Platform).To(Equal(appstore.PlatformMacOS))
 		Expect(store.purchaseInput.App).To(Equal(appstore.App{ID: 42, BundleID: "com.example.mac"}))
 	})
+
+	DescribeTable("refreshes sign-in once with command context and emits refreshed storefront", func(initialErr error) {
+		var buf bytes.Buffer
+		store := &fakePurchaseAppStore{
+			account:        appstore.Account{Email: "user@example.com", Password: "secret", StoreFront: "143441"},
+			loginAccount:   appstore.Account{Email: "user@example.com", Password: "secret", StoreFront: "143462"},
+			purchaseErrors: []error{initialErr, nil},
+		}
+		previousDependencies := dependencies
+		DeferCleanup(func() { dependencies = previousDependencies })
+		dependencies.Logger = log.NewLogger(log.Args{Writer: &buf})
+
+		ctx := context.WithValue(context.Background(), interactiveKey, false)
+		cmd := purchaseCmdWithAppStore(func() appstore.AppStore { return store })
+		cmd.SetContext(ctx)
+		cmd.SetArgs([]string{"--app-id", "42"})
+
+		Expect(cmd.Execute()).To(Succeed())
+		Expect(store.accountInfoCalls).To(Equal(1))
+		Expect(store.loginInputs).To(Equal([]appstore.LoginInput{{Context: ctx, Email: "user@example.com", Password: "secret"}}))
+		Expect(store.purchaseCalls).To(Equal(2))
+		Expect(store.purchaseInput.Account.StoreFront).To(Equal("143462"))
+		Expect(buf.String()).To(ContainSubstring(`"sessionRefreshed":true`))
+		Expect(buf.String()).To(ContainSubstring(`"storeFront":"143462"`))
+	},
+		Entry("expired password token", appstore.ErrPasswordTokenExpired),
+		Entry("missing Store AMD provisioning", fmt.Errorf("generate Store AMD proof: %w", appstore.ErrStoreAMDNotProvisioned)),
+	)
 })
 
 type fakePurchaseAppStore struct {
-	lookupCalls   int
-	lookupInput   appstore.LookupInput
-	purchaseInput appstore.PurchaseInput
+	account          appstore.Account
+	accountInfoCalls int
+	loginAccount     appstore.Account
+	loginInputs      []appstore.LoginInput
+	lookupCalls      int
+	lookupInput      appstore.LookupInput
+	purchaseCalls    int
+	purchaseErrors   []error
+	purchaseInput    appstore.PurchaseInput
 }
 
-func (*fakePurchaseAppStore) Login(input appstore.LoginInput) (appstore.LoginOutput, error) {
-	return appstore.LoginOutput{}, nil
+func (f *fakePurchaseAppStore) Login(input appstore.LoginInput) (appstore.LoginOutput, error) {
+	f.loginInputs = append(f.loginInputs, input)
+	return appstore.LoginOutput{Account: f.loginAccount}, nil
 }
 
-func (*fakePurchaseAppStore) AccountInfo() (appstore.AccountInfoOutput, error) {
-	return appstore.AccountInfoOutput{Account: appstore.Account{StoreFront: "143441"}}, nil
+func (f *fakePurchaseAppStore) AccountInfo() (appstore.AccountInfoOutput, error) {
+	f.accountInfoCalls++
+	if f.account.StoreFront == "" {
+		return appstore.AccountInfoOutput{Account: appstore.Account{StoreFront: "143441"}}, nil
+	}
+	return appstore.AccountInfoOutput{Account: f.account}, nil
 }
 
 func (*fakePurchaseAppStore) Revoke() error { return nil }
@@ -110,6 +153,11 @@ func (*fakePurchaseAppStore) OwnedApps(input appstore.OwnedAppsInput) (appstore.
 
 func (f *fakePurchaseAppStore) Purchase(input appstore.PurchaseInput) error {
 	f.purchaseInput = input
+	idx := f.purchaseCalls
+	f.purchaseCalls++
+	if idx < len(f.purchaseErrors) && f.purchaseErrors[idx] != nil {
+		return f.purchaseErrors[idx]
+	}
 
 	return nil
 }

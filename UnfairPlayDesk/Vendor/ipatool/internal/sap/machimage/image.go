@@ -38,6 +38,7 @@ type Image struct {
 	name         string
 	data         []byte
 	modified     map[uint64][]byte
+	sharedDigest [sha256.Size]byte
 	instructions map[uint64][]instructionPatch
 	file         *macho.File
 	base         uint64
@@ -65,6 +66,10 @@ func Open(name string, input []byte) (*Image, error) {
 }
 
 func openImage(name string, data []byte, modified map[uint64][]byte) (*Image, error) {
+	return openImageWithDigest(name, data, modified, [sha256.Size]byte{}, false)
+}
+
+func openImageWithDigest(name string, data []byte, modified map[uint64][]byte, knownDigest [sha256.Size]byte, hasKnownDigest bool) (*Image, error) {
 	image := &Image{name: name, data: data, modified: modified}
 
 	var reader io.ReaderAt = bytes.NewReader(data)
@@ -80,7 +85,12 @@ func openImage(name string, data []byte, modified map[uint64][]byte) (*Image, er
 	var cached bool
 
 	if modified != nil {
-		key = sha256.Sum256(data)
+		if hasKnownDigest {
+			key = knownDigest
+		} else {
+			key = sha256.Sum256(data)
+		}
+		image.sharedDigest = key
 		preparation, cached = imagePreparations.get(key)
 	}
 
@@ -604,28 +614,9 @@ func (i *Image) PreparePrelinked(external map[uint64]string, resolve func(string
 		return nil
 	}
 
-	for _, item := range i.segments {
-		if item.name == "__TEXT" || item.name == "__LINKEDIT" || item.fileSize < pointerSize {
-			continue
-		}
-
-		start := item.fileOff
-		if remainder := item.address % pointerSize; remainder != 0 {
-			start += pointerSize - remainder
-		}
-
-		end := item.fileOff + item.fileSize
-		for offset := start; offset <= end-pointerSize; offset += pointerSize {
-			current := i.pointerAt(offset)
-
-			value, ok := patched[current]
-			if !ok {
-				continue
-			}
-
-			if err := i.putPointer(offset, value); err != nil {
-				return err
-			}
+	for _, fixup := range i.prelinkedFixups(external) {
+		if err := i.putPointer(fixup.offset, patched[fixup.original]); err != nil {
+			return err
 		}
 	}
 

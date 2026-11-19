@@ -81,7 +81,12 @@ func (t *appstore) sendEntDownload(ctx context.Context, endpoint downloadProduct
 
 	reportDownloadStage(ctx, "正在读取下载授权缓存")
 	if cached := t.cachedKBSync(dsid, guid); cached != "" {
-		res, err := t.sendEntDownloadRequest(ctx, endpoint, acc, app, guid, versionID, hardwareID, cached)
+		proof, err := t.entDownloadProof(ctx, endpoint, guid, hardwareID)
+		if err != nil {
+			return http.Result[downloadResult]{}, err
+		}
+
+		res, err := t.sendEntDownloadRequest(ctx, endpoint, acc, app, guid, versionID, hardwareID, cached, proof)
 		if err == nil {
 			return res, nil
 		}
@@ -95,21 +100,35 @@ func (t *appstore) sendEntDownload(ctx context.Context, endpoint downloadProduct
 		t.invalidateKBSync(dsid, guid, cached)
 	}
 
+	proof, err := t.entDownloadProof(ctx, endpoint, guid, hardwareID)
+	if err != nil {
+		return http.Result[downloadResult]{}, err
+	}
+
 	reportDownloadStage(ctx, "正在准备下载授权")
 	blob, err := t.generateKBSync(ctx, hardwareID, dsid)
 	if err != nil {
 		return http.Result[downloadResult]{}, err
 	}
 
-	res, err := t.sendEntDownloadRequest(ctx, endpoint, acc, app, guid, versionID, hardwareID, blob)
-	if err == nil && res.Data.FailureType == "" {
+	res, err := t.sendEntDownloadRequest(ctx, endpoint, acc, app, guid, versionID, hardwareID, blob, proof)
+	if err == nil && (res.Data.FailureType == "" || res.Data.FailureType == FailureTypeLicenseNotFound) {
 		t.storeKBSync(dsid, guid, blob)
 	}
 
 	return res, err
 }
 
-func (t *appstore) sendEntDownloadRequest(ctx context.Context, endpoint downloadProductEndpoint, acc Account, app App, guid, versionID string, hardwareID []byte, blob string) (http.Result[downloadResult], error) {
+func (t *appstore) entDownloadProof(ctx context.Context, endpoint downloadProductEndpoint, guid string, hardwareID []byte) (map[string]string, error) {
+	reportDownloadStage(ctx, "正在生成商店验证信息")
+	if t.authBackend == nil {
+		return nil, nil
+	}
+
+	return t.storeAMDProof(ctx, fmt.Sprintf("%s?guid=%s", endpoint.baseURL, guid), hardwareID)
+}
+
+func (t *appstore) sendEntDownloadRequest(ctx context.Context, endpoint downloadProductEndpoint, acc Account, app App, guid, versionID string, hardwareID []byte, blob string, proof map[string]string) (http.Result[downloadResult], error) {
 	serial := append([]byte{0x54, 0xc8, 0xb0, 0xa9, 0x88}, hardwareID[2:]...)
 	request := t.downloadProductRequest(endpoint, acc, app, guid, "")
 
@@ -120,16 +139,8 @@ func (t *appstore) sendEntDownloadRequest(ctx context.Context, endpoint download
 	request.Headers["X-Apple-Store-Front"] = acc.StoreFront
 	request.Headers["X-Token"] = acc.PasswordToken
 
-	reportDownloadStage(ctx, "正在生成商店验证信息")
-	if t.authBackend != nil {
-		proof, err := t.storeAMDProof(ctx, request.URL, hardwareID)
-		if err != nil {
-			return http.Result[downloadResult]{}, err
-		}
-
-		for key, value := range proof {
-			request.Headers[key] = value
-		}
+	for key, value := range proof {
+		request.Headers[key] = value
 	}
 
 	request.Payload = &http.XMLPayload{Content: map[string]interface{}{

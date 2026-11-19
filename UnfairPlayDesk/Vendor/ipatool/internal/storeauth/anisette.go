@@ -28,11 +28,48 @@ const (
 	machineFinishURL   = "https://gsa.apple.com/grandslam/MidService/finishMachineProvisioning"
 	anisetteClientInfo = "<MacBookPro13,3> <Mac OS X;10.12.6;16G29> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
 	anisetteUserAgent  = "akd/1.0 CFNetwork/811.5.4 Darwin/16.7.0"
+	stateKindMachine   = "machine"
+	stateKindStore     = "store"
 )
+
+var ErrStoreAMDNotProvisioned = errors.New("store AMD state is not provisioned")
 
 type anisetteState struct {
 	Identifier, Provisioning []byte
 	RoutingInfo              uint64
+	Kind                     string `json:",omitempty"`
+}
+
+// HasStoreAMDState reports whether encoded holds Store AMD provisioning rather
+// than an unprovisioned identity or general machine Anisette state. Legacy
+// pre-Kind states with non-empty Provisioning remain eligible once for upgrade.
+func HasStoreAMDState(encoded []byte) bool {
+	if len(encoded) == 0 {
+		return false
+	}
+
+	state, err := decodeAnisetteState(encoded)
+	if err != nil {
+		return false
+	}
+
+	return len(state.Provisioning) != 0 && state.Kind != stateKindMachine
+}
+
+// DeviceIdentityState strips non-Store provisioning while preserving (or
+// creating) the 16-byte software device identifier.
+func DeviceIdentityState(encoded []byte) ([]byte, error) {
+	state, err := decodeAnisetteState(encoded)
+	if err != nil {
+		return nil, err
+	}
+
+	updated, err := json.Marshal(anisetteState{Identifier: state.Identifier})
+	if err != nil {
+		return nil, errors.New("encode anisette identity state")
+	}
+
+	return updated, nil
 }
 
 type machineProvisioningEnvelope struct {
@@ -54,15 +91,24 @@ func AnisetteHeaders(ctx context.Context, client *http.Client, encoded []byte) (
 		return nil, nil, err
 	}
 
-	// Store provisioning replaces the ADI database. If its proof cannot be
-	// reused, start general machine provisioning from the persisted identity.
-	state.Provisioning = nil
-	state.RoutingInfo = 0
-
 	bundle, err := assets.Load(ctx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("load anisette assets: %w", err)
 	}
+
+	if state.Kind == stateKindMachine && len(state.Provisioning) != 0 && state.RoutingInfo != 0 {
+		if headers, updated, reuseErr := reuseMachineAnisette(ctx, bundle, state); reuseErr == nil {
+			return headers, updated, nil
+		} else if ctx.Err() != nil {
+			return nil, nil, fmt.Errorf("reuse anisette runtime: %w", ctx.Err())
+		}
+	}
+
+	// Store provisioning replaces the ADI database. If its proof cannot be
+	// reused, start general machine provisioning from the persisted identity.
+	state.Provisioning = nil
+	state.RoutingInfo = 0
+	state.Kind = stateKindMachine
 
 	adi, err := machine.OpenModernADI(ctx, bundle, state.Identifier, nil)
 	if err != nil {
@@ -83,6 +129,7 @@ func AnisetteHeaders(ctx context.Context, client *http.Client, encoded []byte) (
 	if err != nil {
 		return nil, nil, fmt.Errorf("read anisette state: %w", err)
 	}
+	state.Kind = stateKindMachine
 
 	updated, err := json.Marshal(state)
 	if err != nil {
@@ -90,6 +137,37 @@ func AnisetteHeaders(ctx context.Context, client *http.Client, encoded []byte) (
 	}
 
 	return anisetteHeaders(state, otp, mid), updated, nil
+}
+
+func reuseMachineAnisette(ctx context.Context, bundle assets.Bundle, state *anisetteState) (http.Header, []byte, error) {
+	adi, err := machine.OpenModernADI(ctx, bundle, state.Identifier, state.Provisioning)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() { _ = adi.Close() }()
+
+	mid, otp, err := adi.RequestOTP(machineDSID)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	nextProvisioning, err := adi.State()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	next := &anisetteState{
+		Identifier:   state.Identifier,
+		Provisioning: nextProvisioning,
+		RoutingInfo:  state.RoutingInfo,
+		Kind:         stateKindMachine,
+	}
+	updated, err := json.Marshal(next)
+	if err != nil {
+		return nil, nil, errors.New("encode anisette state")
+	}
+
+	return anisetteHeaders(next, otp, mid), updated, nil
 }
 
 func provisionMachine(ctx context.Context, client *http.Client, state *anisetteState, adi *machine.ModernADI) error {
@@ -208,7 +286,8 @@ func decodeAnisetteState(encoded []byte) (*anisetteState, error) {
 	}
 
 	var state anisetteState
-	if json.Unmarshal(encoded, &state) != nil || len(state.Identifier) != 16 || len(state.Provisioning) > anisetteLimit {
+	if json.Unmarshal(encoded, &state) != nil || len(state.Identifier) != 16 || len(state.Provisioning) > anisetteLimit ||
+		(state.Kind != "" && state.Kind != stateKindMachine && state.Kind != stateKindStore) {
 		return nil, errors.New("invalid persisted anisette state")
 	}
 
@@ -216,21 +295,44 @@ func decodeAnisetteState(encoded []byte) (*anisetteState, error) {
 }
 
 func anisetteHeaders(state *anisetteState, otp, mid []byte) http.Header {
-	localUserID, deviceID := anisetteIdentityHeaders(state.Identifier)
-	now := time.Now()
-	headers := make(http.Header)
-	headers.Set("X-Apple-I-Client-Time", now.UTC().Format("2006-01-02T15:04:05Z"))
+	headers := deviceIdentityHeaders(state.Identifier)
 	headers.Set("X-Apple-I-MD", base64.StdEncoding.EncodeToString(otp))
 	headers.Set("X-Apple-I-MD-M", base64.StdEncoding.EncodeToString(mid))
 	headers.Set("X-Apple-I-MD-RINFO", strconv.FormatUint(state.RoutingInfo, 10))
+	return headers
+}
+
+func deviceIdentityHeaders(identifier []byte) http.Header {
+	localUserID, deviceID := anisetteIdentityHeaders(identifier)
+	now := time.Now()
+	headers := make(http.Header)
+	headers.Set("X-Apple-I-Client-Time", now.UTC().Format("2006-01-02T15:04:05Z"))
 	headers.Set("X-Apple-I-MD-LU", localUserID)
 	headers.Set("X-Apple-I-SRL-NO", "0")
 	headers.Set("X-Apple-I-TimeZone", now.Location().String())
 	headers.Set("X-Apple-Locale", "en_US")
 	headers.Set("X-Mme-Device-Id", deviceID)
 	headers.Set("X-MMe-Client-Info", anisetteClientInfo)
-
 	return headers
+}
+
+// StoreAMDLoginHeaders pairs the Store proof with the same persisted identity
+// used for general machine and Store provisioning.
+func StoreAMDLoginHeaders(encoded []byte, proof map[string]string) (http.Header, error) {
+	if len(encoded) == 0 {
+		return nil, errors.New("missing persisted Store identity")
+	}
+	state, err := decodeAnisetteState(encoded)
+	if err != nil {
+		return nil, err
+	}
+	headers := deviceIdentityHeaders(state.Identifier)
+	for _, key := range []string{"X-Apple-AMD", "X-Apple-AMD-M"} {
+		if value := proof[key]; value != "" {
+			headers.Set(key, value)
+		}
+	}
+	return headers, nil
 }
 
 func anisetteIdentityHeaders(identifier []byte) (string, string) {

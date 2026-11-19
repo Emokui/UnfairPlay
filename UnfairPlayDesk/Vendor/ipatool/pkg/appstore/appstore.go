@@ -43,29 +43,33 @@ type AppStore interface {
 }
 
 type appstore struct {
-	authenticationProgress func(string)
-	keychain               keychain.Keychain
-	loginClient            http.Client[loginResult]
-	searchClient           http.Client[searchResult]
-	purchaseClient         http.Client[purchaseResult]
-	downloadClient         http.Client[downloadResult]
-	kbsyncGenerator        kbsyncGenerator
-	kbsyncCache            kbsyncCache
-	platformClient         http.Client[platformVersionLookupResult]
-	storefrontClient       http.Client[[]byte]
-	bagClient              http.Client[bagResult]
-	ownedAppsClient        http.Client[[]byte]
-	httpClient             http.Client[interface{}]
-	macDecrypterFactory    macPackageDecrypterFactory
-	actionSignerFactory    ActionSignerFactory
-	authRetrySleep         func(time.Duration)
-	machine                machine.Machine
-	os                     operatingsystem.OperatingSystem
-	authBackend            *store.Backend
-	authHTTP               *gohttp.Client
-	authStateMu            sync.Mutex
-	anisetteState          []byte
-	authenticationHeaders  gohttp.Header
+	authenticationProgress        func(string)
+	keychain                      keychain.Keychain
+	loginClient                   http.Client[loginResult]
+	searchClient                  http.Client[searchResult]
+	purchaseClient                http.Client[purchaseResult]
+	downloadClient                http.Client[downloadResult]
+	kbsyncGenerator               kbsyncGenerator
+	kbsyncCache                   kbsyncCache
+	platformClient                http.Client[platformVersionLookupResult]
+	storefrontClient              http.Client[[]byte]
+	bagClient                     http.Client[bagResult]
+	ownedAppsClient               http.Client[[]byte]
+	httpClient                    http.Client[interface{}]
+	macDecrypterFactory           macPackageDecrypterFactory
+	actionSignerFactory           ActionSignerFactory
+	authRetrySleep                func(time.Duration)
+	machine                       machine.Machine
+	os                            operatingsystem.OperatingSystem
+	authBackend                   *store.Backend
+	authHTTP                      *gohttp.Client
+	authStateMu                   sync.Mutex
+	anisetteState                 []byte
+	loginCompletedWithoutStoreAMD bool
+	authenticationHeaders         gohttp.Header
+	bagMu                         sync.Mutex
+	cachedBagGUID                 string
+	cachedURLBag                  *urlBag
 }
 
 type Args struct {
@@ -92,6 +96,8 @@ func NewAppStore(args Args) AppStore {
 		Executor:  backend.Client("request"),
 	}
 
+	catalogArgs := http.Args{Timeout: http.DefaultAuthenticationTimeout, Executor: backend.Client("catalog")}
+
 	actionSignerFactory := args.ActionSignerFactory
 	if actionSignerFactory == nil {
 		actionSignerFactory = frameworkActionSignerFactory(backend.Client("sap"))
@@ -101,12 +107,12 @@ func NewAppStore(args Args) AppStore {
 		authenticationProgress: args.AuthenticationProgress,
 		keychain:               args.Keychain,
 		loginClient:            http.NewClient[loginResult](http.Args{CookieJar: args.CookieJar, Authentication: true, Executor: backend.Client("authenticate")}),
-		searchClient:           http.NewClient[searchResult](clientArgs),
+		searchClient:           http.NewClient[searchResult](catalogArgs),
 		purchaseClient:         http.NewClient[purchaseResult](http.Args{CookieJar: args.CookieJar, Timeout: http.DefaultAuthenticationTimeout, Executor: backend.Client("purchase")}),
 		downloadClient:         http.NewClient[downloadResult](clientArgs),
 		kbsyncGenerator:        defaultKBSyncGenerator,
-		platformClient:         http.NewClient[platformVersionLookupResult](clientArgs),
-		storefrontClient:       http.NewClient[[]byte](clientArgs),
+		platformClient:         http.NewClient[platformVersionLookupResult](catalogArgs),
+		storefrontClient:       http.NewClient[[]byte](catalogArgs),
 		bagClient:              http.NewClient[bagResult](http.Args{CookieJar: args.CookieJar, Timeout: http.DefaultAuthenticationTimeout, Executor: backend.Client("bag-direct")}),
 		ownedAppsClient:        http.NewClient[[]byte](clientArgs),
 		httpClient:             http.NewClient[interface{}](http.Args{CookieJar: args.CookieJar, Executor: backend.Client("transfer")}),

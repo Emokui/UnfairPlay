@@ -1,4 +1,4 @@
-//go:build !ios
+//go:build (!darwin || !cgo) && !ios
 
 package cmd
 

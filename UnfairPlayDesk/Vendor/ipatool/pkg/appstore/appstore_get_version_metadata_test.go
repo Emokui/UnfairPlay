@@ -3,6 +3,7 @@ package appstore
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -570,5 +571,40 @@ var _ = Describe("AppStore (GetVersionMetadata)", func() {
 			Entry("default platform", Platform("")),
 			Entry("watchOS", PlatformWatchOS),
 		)
+	})
+
+	It("aborts IPA range reads when input context is canceled", func() {
+		started := make(chan struct{})
+		server := httptest.NewServer(gohttp.HandlerFunc(func(w gohttp.ResponseWriter, r *gohttp.Request) {
+			select {
+			case <-started:
+			default:
+				close(started)
+			}
+			<-r.Context().Done()
+		}))
+		defer server.Close()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		mockMachine.EXPECT().MacAddress().Return("00:11:22:33:44:55", nil)
+		mockDownloadClient.EXPECT().Send(gomock.Any()).Return(http.Result[downloadResult]{
+			StatusCode: gohttp.StatusOK,
+			Data:       downloadResult{Items: []downloadItemResult{{URL: server.URL}}},
+		}, nil)
+
+		done := make(chan error, 1)
+		go func() {
+			_, err := as.GetVersionMetadata(GetVersionMetadataInput{
+				Context:   ctx,
+				App:       App{ID: 42},
+				VersionID: "123",
+			})
+			done <- err
+		}()
+
+		Eventually(started).Should(BeClosed())
+		cancel()
+		Eventually(done).Should(Receive(MatchError(ContainSubstring(context.Canceled.Error()))))
 	})
 })

@@ -397,6 +397,156 @@ var _ = Describe("AppStore (Download Product)", func() {
 		})
 	})
 
+	Describe("commerce response validation and bag reuse", func() {
+		It("rejects mismatched historical versions and malformed items on volumeStore and redownload", func() {
+			app.BundleID = "com.example.app"
+			bag := validBagResult()
+			bag.URLBag.RedownloadEndpoint = testRedownloadEndpoint
+
+			for _, endpoint := range []string{"volumeStore", "redownload"} {
+				for _, tc := range []struct {
+					res     http.Result[downloadResult]
+					message string
+				}{
+					{
+						res: http.Result[downloadResult]{
+							StatusCode: gohttp.StatusOK,
+							Data: downloadResult{Items: []downloadItemResult{{
+								URL:      "https://example.com/app.ipa",
+								Metadata: map[string]interface{}{"softwareVersionExternalIdentifier": "999999999"},
+							}}},
+						},
+						message: "does not match the requested app or version",
+					},
+					{
+						res: http.Result[downloadResult]{
+							StatusCode: gohttp.StatusOK,
+							Data: downloadResult{Items: []downloadItemResult{{
+								URL:      "https://example.com/app.ipa",
+								Metadata: map[string]interface{}{"itemId": uint64(111)},
+							}}},
+						},
+						message: "does not match the requested app or version",
+					},
+					{
+						res: http.Result[downloadResult]{
+							StatusCode: gohttp.StatusOK,
+							Data: downloadResult{Items: []downloadItemResult{{
+								URL:      "https://example.com/app.ipa",
+								Metadata: map[string]interface{}{"softwareVersionBundleId": "com.example.other"},
+							}}},
+						},
+						message: "does not match the requested bundle identifier",
+					},
+					{
+						res: http.Result[downloadResult]{
+							StatusCode: gohttp.StatusOK,
+							Data: downloadResult{Items: []downloadItemResult{{
+								URL: "https://example.com/app.ipa",
+								Metadata: map[string]interface{}{
+									"itemId":                  uint64(app.ID),
+									"softwareVersionBundleId": app.BundleID,
+								},
+							}}},
+						},
+						message: "does not match the requested app or version",
+					},
+					{
+						res: http.Result[downloadResult]{
+							StatusCode: gohttp.StatusOK,
+							Data: downloadResult{Items: []downloadItemResult{{
+								URL:      "https://example.com/app.ipa",
+								Metadata: map[string]interface{}{"softwareVersionExternalIdentifier": nil},
+							}}},
+						},
+						message: "does not match the requested app or version",
+					},
+					{
+						res: http.Result[downloadResult]{
+							StatusCode: gohttp.StatusOK,
+							Data: downloadResult{Items: []downloadItemResult{{
+								URL:      "https://example.com/app.ipa",
+								Metadata: map[string]interface{}{"softwareVersionBundleId": nil},
+							}}},
+						},
+						message: "does not match the requested bundle identifier",
+					},
+					{
+						res: http.Result[downloadResult]{
+							StatusCode: gohttp.StatusOK,
+							Data:       downloadResult{Items: []downloadItemResult{{URL: "a"}, {URL: "b"}}},
+						},
+						message: "must contain exactly one item",
+					},
+					{
+						res: http.Result[downloadResult]{
+							StatusCode: gohttp.StatusBadGateway,
+							Data:       downloadResult{Items: []downloadItemResult{{URL: "https://example.com/app.ipa"}}},
+						},
+						message: "unexpected " + endpoint + " status code: 502",
+					},
+					{
+						res: http.Result[downloadResult]{
+							StatusCode: gohttp.StatusOK,
+							Data: downloadResult{
+								CustomerMessage: "Item unavailable",
+								Items:           []downloadItemResult{{URL: "https://example.com/app.ipa"}},
+							},
+						},
+						message: "received " + endpoint + " error: Item unavailable",
+					},
+				} {
+					if endpoint == "volumeStore" {
+						mockDownloadClient.EXPECT().Send(gomock.Any()).Return(tc.res, nil)
+					} else {
+						gomock.InOrder(
+							mockDownloadClient.EXPECT().Send(gomock.Any()).
+								Return(http.Result[downloadResult]{StatusCode: gohttp.StatusOK}, nil),
+							mockBagClient.EXPECT().Send(gomock.Any()).
+								Return(http.Result[bagResult]{StatusCode: gohttp.StatusOK, Data: bag}, nil).MaxTimes(1),
+							mockDownloadClient.EXPECT().Send(gomock.Any()).Return(tc.res, nil),
+						)
+					}
+
+					_, _, err := store.sendDownloadProduct(context.Background(), account, app, testGUID, testVersionID, PlatformIPhone)
+					Expect(err).To(MatchError(ContainSubstring(tc.message)))
+				}
+			}
+		})
+
+		It("rejects an HTTP 200 download item without a package URL before starting transfer", func() {
+			mockMachine := machine.NewMockMachine(ctrl)
+			store.machine = mockMachine
+			mockMachine.EXPECT().MacAddress().Return("00:11:22:33:44:55", nil)
+			mockDownloadClient.EXPECT().Send(gomock.Any()).Return(http.Result[downloadResult]{
+				StatusCode: gohttp.StatusOK,
+				Data:       downloadResult{Items: []downloadItemResult{{Metadata: map[string]interface{}{"bundleShortVersionString": "1.0"}}}},
+			}, nil)
+
+			_, err := store.Download(DownloadInput{Account: account, App: app, Platform: PlatformIPhone})
+			Expect(err).To(MatchError("download response has no package URL"))
+		})
+
+		It("reuses the fetched bag for the same GUID and clears it on revoke", func() {
+			bag := validBagResult()
+			bag.URLBag.RedownloadEndpoint = testRedownloadEndpoint
+			mockBagClient.EXPECT().Send(gomock.Any()).
+				Return(http.Result[bagResult]{StatusCode: gohttp.StatusOK, Data: bag}, nil).Times(1)
+
+			first, err := store.fetchURLBagContext(context.Background(), testGUID)
+			Expect(err).ToNot(HaveOccurred())
+			second, err := store.fetchURLBagContext(context.Background(), "001122334455")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(second).To(Equal(first))
+
+			otherBag := validBagResult()
+			mockBagClient.EXPECT().Send(gomock.Any()).
+				Return(http.Result[bagResult]{StatusCode: gohttp.StatusOK, Data: otherBag}, nil).Times(1)
+			_, err = store.fetchURLBagContext(context.Background(), "AABBCCDDEEFF")
+			Expect(err).ToNot(HaveOccurred())
+		})
+	})
+
 })
 
 var _ = Describe("AppStore (Download Customer Messages)", func() {

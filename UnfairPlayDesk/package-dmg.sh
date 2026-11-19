@@ -11,6 +11,8 @@ STAGE="$(mktemp -d "$PWD/build/dmg-stage.XXXXXX")"
 trap 'rm -rf "$STAGE"' EXIT
 codesign --verify --deep --strict "$APP"
 ditto "$APP" "$STAGE/UnfairPlay.app"
+chmod -R u=rwX,go=rX "$STAGE/UnfairPlay.app"
+codesign --verify --deep --strict "$STAGE/UnfairPlay.app"
 ln -s /Applications "$STAGE/Applications"
 hdiutil create -volname UnfairPlay -srcfolder "$STAGE" -fs HFS+ -format UDZO -ov "$OUTPUT"
 hdiutil verify "$OUTPUT"

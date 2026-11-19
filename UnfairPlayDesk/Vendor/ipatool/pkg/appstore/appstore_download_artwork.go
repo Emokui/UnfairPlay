@@ -18,7 +18,7 @@ func (t *appstore) downloadArtwork(ctx context.Context, url string) ([]byte, err
 		ctx = context.Background()
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 	req, err := t.httpClient.NewRequest(http.MethodGet, url, nil)
 	if err != nil {

@@ -5,13 +5,16 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"maps"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/majd/ipatool/v2/internal/sap/assets"
 	"github.com/majd/ipatool/v2/internal/sap/machimage"
 	"github.com/majd/ipatool/v2/internal/sap/unicorn"
 	storeprofile "github.com/majd/ipatool/v2/internal/store/profile"
@@ -23,6 +26,21 @@ const heapSize = uint64(64 << 20)
 const stackBase = uint64(0x500000000000)
 const stackSize = uint64(8 << 20)
 const returnPC = uint64(0x100000000)
+
+var (
+	pinnedFrameworkDigest = mustEmulatorDigest("95f4558aa2c0ccd9f96ed479e336b630b46bf4b4e0baabc1c1ac8c7d55e21ab4")
+	pinnedPluginDigest    = mustEmulatorDigest("e33fff05a6e6593dd91e33fd103b5d3068b62a787c680df33b859f19b3acc4ea")
+)
+
+func mustEmulatorDigest(encoded string) [sha256.Size]byte {
+	var digest [sha256.Size]byte
+	raw, err := hex.DecodeString(encoded)
+	if err != nil || len(raw) != len(digest) {
+		panic("invalid Store emulator image digest")
+	}
+	copy(digest[:], raw)
+	return digest
+}
 
 type Method = profileformat.Method
 type Class = profileformat.Class
@@ -62,7 +80,7 @@ type Runtime struct {
 	allocations                 map[uint64]uint64
 	ctx                         context.Context
 	codeRanges                  [][2]uint64
-	steps                       uint64
+	dispatchPages               map[uint64]bool
 	timers                      []timer
 	callbacks                   map[uint64]func()
 	pending                     []uint64
@@ -82,16 +100,32 @@ type Runtime struct {
 	trace                       []string
 
 	entries map[uint64]string
-	hook    *unicorn.Hook
 }
 
 func Open(ctx context.Context, imageData []byte, prepared storeprofile.Data) (*Runtime, error) {
 	return open(ctx, imageData, prepared, false)
 }
 
+// OpenPinned uses the process-wide, integrity-checked assets and profile.
+func OpenPinned(ctx context.Context) (*Runtime, error) {
+	bundle, err := assets.Load(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("load Store runtime assets: %w", err)
+	}
+	prepared, err := storeprofile.Load(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("load Store runtime profile: %w", err)
+	}
+	return openRuntime(ctx, bundle.AppleMediaServices, prepared, false, true)
+}
+
 // open optionally guards accesses against the exported page set. Validation and
 // production use the same grouped mappings to stay within Unicorn section limits.
 func open(ctx context.Context, imageData []byte, prepared storeprofile.Data, strict bool) (*Runtime, error) {
+	return openRuntime(ctx, imageData, prepared, strict, false)
+}
+
+func openRuntime(ctx context.Context, imageData []byte, prepared storeprofile.Data, strict, verified bool) (*Runtime, error) {
 	if ctx == nil {
 		return nil, errors.New("emulator context is nil")
 	}
@@ -100,7 +134,7 @@ func open(ctx context.Context, imageData []byte, prepared storeprofile.Data, str
 		return nil, fmt.Errorf("prepare store runtime: %w", err)
 	}
 
-	if fmt.Sprintf("%x", sha256.Sum256(imageData)) != "95f4558aa2c0ccd9f96ed479e336b630b46bf4b4e0baabc1c1ac8c7d55e21ab4" {
+	if !verified && sha256.Sum256(imageData) != pinnedFrameworkDigest {
 		return nil, errors.New("AppleMediaServices does not match the pinned 26A434 image")
 	}
 
@@ -111,7 +145,12 @@ func open(ctx context.Context, imageData []byte, prepared storeprofile.Data, str
 
 	profile := metadata.profile
 
-	imageInputs := map[string][]byte{"AppleMediaServices": imageData}
+	type runtimeImageInput struct {
+		name   string
+		data   []byte
+		digest [sha256.Size]byte
+	}
+	imageInputs := []runtimeImageInput{{name: "AppleMediaServices", data: imageData, digest: pinnedFrameworkDigest}}
 
 	if profile.PluginUUID != "" {
 		if profile.PluginUUID != "B8C07F94-4868-3CD7-A59A-F01E8C24C1B7" {
@@ -119,11 +158,15 @@ func open(ctx context.Context, imageData []byte, prepared storeprofile.Data, str
 		}
 
 		plugin := prepared.Plugin
-		if fmt.Sprintf("%x", sha256.Sum256(plugin)) != "e33fff05a6e6593dd91e33fd103b5d3068b62a787c680df33b859f19b3acc4ea" {
+		if !verified && sha256.Sum256(plugin) != pinnedPluginDigest {
 			return nil, errors.New("authentication plugin does not match the pinned image")
 		}
 
-		imageInputs["AMSAccountAuthenticationPlugin"] = plugin
+		imageInputs = append(imageInputs, runtimeImageInput{
+			name:   "AMSAccountAuthenticationPlugin",
+			data:   plugin,
+			digest: pinnedPluginDigest,
+		})
 	}
 
 	engine, err := unicorn.New(ctx)
@@ -151,8 +194,8 @@ func open(ctx context.Context, imageData []byte, prepared storeprofile.Data, str
 
 	images := make([]*machimage.Image, 0, len(imageInputs))
 
-	for name, data := range imageInputs {
-		image, e := machimage.OpenShared(name, data)
+	for _, item := range imageInputs {
+		image, e := machimage.OpenSharedVerified(item.name, item.data, item.digest)
 		if e != nil {
 			return nil, fmt.Errorf("prepare store runtime: %w", e)
 		}
@@ -261,9 +304,35 @@ func open(ctx context.Context, imageData []byte, prepared storeprofile.Data, str
 		}
 	}
 
-	r.hook, err = engine.AddCodeHook(0, ^uint64(0), r.step)
-	if err != nil {
+	if _, err = engine.AddBlockHook(r.checkBlock); err != nil {
 		return nil, fmt.Errorf("prepare store runtime: %w", err)
+	}
+
+	// Host callbacks allocated at runtime live in the heap. Static bridge
+	// instructions are clustered by page to keep the instruction hook local.
+	if _, err = engine.AddCodeHook(heapBase, heapBase+heapSize-1, r.step); err != nil {
+		return nil, fmt.Errorf("prepare Store callback hook: %w", err)
+	}
+
+	r.dispatchPages = make(map[uint64]bool)
+	for address := range r.calls {
+		r.dispatchPages[address&^4095] = true
+	}
+	pages := make([]uint64, 0, len(r.dispatchPages))
+	for page := range r.dispatchPages {
+		pages = append(pages, page)
+	}
+	slices.Sort(pages)
+	for i := 0; i < len(pages); {
+		start, end := pages[i], pages[i]+4096
+		i++
+		for i < len(pages) && pages[i] == end {
+			end += 4096
+			i++
+		}
+		if _, err = engine.AddCodeHook(start, end-1, r.step); err != nil {
+			return nil, fmt.Errorf("prepare Store bridge hook: %w", err)
+		}
 	}
 
 	ready = true
@@ -557,6 +626,10 @@ func (r *Runtime) Invoke(object uint64, selector string, args ...uint64) (result
 	return r.call(entry, arguments...)
 }
 func (r *Runtime) call(entry uint64, arguments ...uint64) (uint64, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+
 	var err error
 
 	for i := 0; i < 8; i++ {
@@ -602,20 +675,20 @@ func (r *Runtime) call(entry uint64, arguments ...uint64) (uint64, error) {
 
 	return value, nil
 }
-func (r *Runtime) step(address uint64, _ uint32) {
-	defer func() {
-		if p := recover(); p != nil {
-			r.fault = fmt.Errorf("guest bridge at %#x: %w; recent=%v", address, recoveredError("runtime", p), r.trace)
-			_ = r.engine.Stop()
-		}
-	}()
-
-	if callback := r.callbacks[address]; callback != nil {
-		callback()
-
-		return
+func (r *Runtime) stopGuest(err error) {
+	r.fault = err
+	if r.engine != nil {
+		_ = r.engine.Stop()
 	}
+}
 
+func (r *Runtime) checkBlock(address uint64, size uint32) {
+	if r.ctx != nil {
+		if err := r.ctx.Err(); err != nil {
+			r.stopGuest(err)
+			return
+		}
+	}
 	if name := r.entries[address]; name != "" {
 		r.trace = append(r.trace, name)
 		if len(r.trace) > 12 {
@@ -623,40 +696,59 @@ func (r *Runtime) step(address uint64, _ uint32) {
 		}
 	}
 
-	call, ok := r.calls[address]
-	if !ok {
-		allowed := false
+	// Bridge and callback stubs outside the pinned image are a single RET.
+	_, bridge := r.calls[address]
+	if size == 4 && (bridge || r.callbacks[address] != nil) {
+		return
+	}
 
-		for _, region := range r.codeRanges {
-			if address >= region[0] && address < region[1] {
-				allowed = true
-
+	end := address + uint64(size)
+	if end > address {
+		next := address
+		for next < end {
+			covered := next
+			for _, region := range r.codeRanges {
+				if region[0] <= next && next < region[1] {
+					covered = max(covered, region[1])
+				}
+			}
+			if covered == next {
 				break
 			}
+			next = covered
 		}
-
-		if !allowed {
-			panic(fmt.Sprintf("execution outside the pinned image at %#x", address))
+		if next >= end {
+			return
 		}
+	}
+	r.stopGuest(fmt.Errorf("execution outside the pinned image at %#x (block size %d); recent=%v", address, size, r.trace))
+}
 
-		r.steps++
-		if r.steps%4096 == 0 {
-			if err := r.ctx.Err(); err != nil {
-				panic(err)
-			}
+func (r *Runtime) step(address uint64, _ uint32) {
+	defer func() {
+		if p := recover(); p != nil {
+			r.stopGuest(fmt.Errorf("guest bridge at %#x: %w; recent=%v", address, recoveredError("runtime", p), r.trace))
 		}
+	}()
 
+	if callback := r.callbacks[address]; callback != nil {
+		callback()
+		return
+	}
+
+	call, ok := r.calls[address]
+	if !ok {
 		return
 	}
 
 	if call.Selector != "" {
 		r.message(r.arg(0), call.Selector, false)
-
 		return
 	}
 
 	r.symbol(strings.TrimLeft(call.Symbol, "_"))
 }
+
 func (r *Runtime) jump(entry, receiver uint64, selector string) {
 	_ = r.engine.RegWrite(unicorn.RegX0, receiver)
 	_ = r.engine.RegWrite(unicorn.RegX1, r.selector(selector))
