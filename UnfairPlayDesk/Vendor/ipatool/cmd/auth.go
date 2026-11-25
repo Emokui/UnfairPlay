@@ -168,6 +168,9 @@ func revokeCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if err := removeSessionCookies(activeStateDirectory); err != nil {
+				return err
+			}
 
 			dependencies.Logger.Log().Bool("success", true).Send()
 

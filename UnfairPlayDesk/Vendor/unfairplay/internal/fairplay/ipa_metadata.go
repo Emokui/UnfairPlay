@@ -46,6 +46,8 @@ type ipaDisplayInfo struct {
 	PadIcons    ipaIconSet `plist:"CFBundleIcons~ipad"`
 }
 
+const maxIPAIconBytes = 8 << 20
+
 func ipaMetadataBytes(file *zip.File, maximum uint64) ([]byte, error) {
 	if file.UncompressedSize64 > maximum {
 		return nil, fmt.Errorf("IPA metadata member exceeds reading limit")
@@ -144,7 +146,7 @@ func InspectIPAFile(filename string) IPAFileInfo {
 		base = strings.TrimSuffix(base, ".png")
 		for _, suffix := range []string{"@3x.png", "@2x.png", ".png", "@2x~ipad.png"} {
 			if file := members[root+base+suffix]; file != nil {
-				if icon, err := ipaMetadataBytes(file, 512<<10); err == nil {
+				if icon, err := ipaMetadataBytes(file, maxIPAIconBytes); err == nil {
 					result.Icon = icon
 					return result
 				}
@@ -152,7 +154,7 @@ func InspectIPAFile(filename string) IPAFileInfo {
 		}
 	}
 	if file := members["iTunesArtwork"]; file != nil {
-		if icon, err := ipaMetadataBytes(file, 512<<10); err == nil {
+		if icon, err := ipaMetadataBytes(file, maxIPAIconBytes); err == nil {
 			result.Icon = icon
 		}
 	}

@@ -3,17 +3,19 @@ package cachelock
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"time"
 )
 
 // Acquire serializes cold cache preparation across CLI processes.
 func Acquire(ctx context.Context, path string) (func(), error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ensureLockDirectory(filepath.Dir(path)); err != nil {
 		return nil, err
 	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	file, err := openLockFile(path)
 	if err != nil {
 		return nil, err
 	}

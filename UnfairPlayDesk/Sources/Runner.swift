@@ -27,6 +27,13 @@ enum InputPrompt: Hashable {
 }
 
 final class Runner: ObservableObject {
+    private struct BatchFailureSnapshot {
+        var diagnostic: TaskDiagnostic
+        var output: String
+        var log: String
+        var secrets: [String]
+    }
+
     static var active: [UUID: Runner] = [:]
     let id = UUID()
     @Published var busy = false
@@ -41,6 +48,7 @@ final class Runner: ObservableObject {
     private var diagnostic: TaskDiagnostic?
     private var diagnosticSecrets: [String] = []
     private var diagnosticPhase = ""
+    private var batchFailure: BatchFailureSnapshot?
     var process: Process?
     private var sessionKeyChannel: SessionKeyChannel?
     var master: Int32 = -1
@@ -66,11 +74,22 @@ final class Runner: ObservableObject {
         return Bundle.main.resourceURL!.appendingPathComponent("Tools/worker")
         #endif
     }
-    func launch(_ url: URL, _ args: [String], title: String, privileged: Bool = false, holdsCompletion: Bool = false, sessionAccount: UUID? = nil, batchID: UUID? = nil, done: ((Bool)->Void)? = nil) {
+    func launch(
+        _ url: URL,
+        _ args: [String],
+        title: String,
+        privileged: Bool = false,
+        holdsCompletion: Bool = false,
+        sessionAccount: UUID? = nil,
+        deletingSession: Bool = false,
+        batchID: UUID? = nil,
+        done: ((Bool) -> Void)? = nil
+    ) {
         if let batchID {
             guard self.batchID == batchID, !saving, process == nil, !cancelled else { done?(false); return }
         } else {
             guard !busy else { return }
+            batchFailure = nil
         }
         generation = UUID()
         diagnostic = TaskDiagnostic(title: title, tool: url.lastPathComponent)
@@ -83,22 +102,22 @@ final class Runner: ObservableObject {
         busy = true; inputPrompt = nil; Runner.active[id] = self
         Task { @MainActor in
             do { try await verify() }
-            catch { failLaunch(error.localizedDescription); return }
+            catch { failLaunch(error.localizedDescription, itemTitle: title); return }
             if cancelled {
                 updateCompletionState()
                 self.title = "操作已取消"
                 diagnostic?.finish("已取消")
                 let callback = finished; finished = nil; callback?(false); return
             }
-            startProcess(url, args, token: token, sessionAccount: sessionAccount)
+            startProcess(url, args, itemTitle: title, token: token, sessionAccount: sessionAccount, deletingSession: deletingSession)
         }
     }
-    private func startProcess(_ url: URL, _ args: [String], token: UUID, sessionAccount: UUID?) {
+    private func startProcess(_ url: URL, _ args: [String], itemTitle: String, token: UUID, sessionAccount: UUID?, deletingSession: Bool) {
         diagnostic?.stage("启动任务")
         let task = Process(); task.executableURL = worker
         let channel: SessionKeyChannel?
         do { channel = try sessionAccount.map { _ in try SessionKeyChannel() } }
-        catch { failLaunch(error.localizedDescription); return }
+        catch { failLaunch(error.localizedDescription, itemTitle: itemTitle); return }
         let channelOption = channel == nil ? [] : ["--session-channel"]
         let toolOptions = channel == nil ? [] : ["--desk-session-fd", "3"]
         task.arguments = ["--parent", String(getpid())] + channelOption + [url.path] + toolOptions + args
@@ -106,13 +125,13 @@ final class Runner: ObservableObject {
         environment["TERM"] = "dumb"; environment["NO_COLOR"] = "1"
         task.environment = environment
         var primary: Int32 = -1, secondary: Int32 = -1
-        guard openpty(&primary, &secondary, nil, nil, nil) == 0 else { failLaunch("无法创建交互终端。"); return }
+        guard openpty(&primary, &secondary, nil, nil, nil) == 0 else { failLaunch("无法创建交互终端。", itemTitle: itemTitle); return }
         var attr = termios()
-        guard tcgetattr(secondary, &attr) == 0 else { close(primary); close(secondary); failLaunch("无法配置交互终端。"); return }
+        guard tcgetattr(secondary, &attr) == 0 else { close(primary); close(secondary); failLaunch("无法配置交互终端。", itemTitle: itemTitle); return }
         attr.c_lflag &= ~tcflag_t(ECHO | ECHONL)
-        guard tcsetattr(secondary, TCSANOW, &attr) == 0 else { close(primary); close(secondary); failLaunch("无法关闭输入回显。"); return }
+        guard tcsetattr(secondary, TCSANOW, &attr) == 0 else { close(primary); close(secondary); failLaunch("无法关闭输入回显。", itemTitle: itemTitle); return }
         let flags = fcntl(primary, F_GETFL)
-        guard flags >= 0, fcntl(primary, F_SETFL, flags | O_NONBLOCK) == 0 else { close(primary); close(secondary); failLaunch("无法配置非阻塞终端。"); return }
+        guard flags >= 0, fcntl(primary, F_SETFL, flags | O_NONBLOCK) == 0 else { close(primary); close(secondary); failLaunch("无法配置非阻塞终端。", itemTitle: itemTitle); return }
         let slave = FileHandle(fileDescriptor: secondary, closeOnDealloc: true)
         let reader = FileHandle(fileDescriptor: primary, closeOnDealloc: true)
         master = primary; outputHandle = reader
@@ -147,6 +166,7 @@ final class Runner: ObservableObject {
                 self.title = self.cancelled ? "操作已取消" : ok ? "操作完成" : "操作失败"
                 self.hint = ok || self.cancelled ? nil : Core.errorHint(self.output)
                 if ok { self.progress = 1 }
+                else if !self.cancelled { self.captureBatchFailure(itemTitle: itemTitle) }
                 let callback = self.finished; self.finished = nil
                 callback?(ok)
             }
@@ -155,17 +175,18 @@ final class Runner: ObservableObject {
             try task.run(); try? slave.close()
             sessionKeyChannel = channel
             if let channel, let sessionAccount {
-                channel.serve(account: sessionAccount, deleting: args.contains("revoke"))
+                channel.serve(account: sessionAccount, deleting: deletingSession)
             }
             process = task; busy = true; inputPrompt = nil; Runner.active[id] = self
         } catch {
             reader.readabilityHandler = nil; try? slave.close(); try? reader.close()
-            outputHandle = nil; master = -1; failLaunch(error.localizedDescription)
+            outputHandle = nil; master = -1; failLaunch(error.localizedDescription, itemTitle: itemTitle)
         }
     }
-    func failLaunch(_ reason: String) {
+    func failLaunch(_ reason: String, itemTitle: String? = nil) {
         diagnostic?.finish("启动失败")
-        log = reason; title = "启动失败"; hint = reason; inputPrompt = nil
+        log = reason; output = reason; title = "启动失败"; hint = reason; inputPrompt = nil
+        captureBatchFailure(itemTitle: itemTitle ?? title, detail: reason)
         updateCompletionState()
         let callback = finished; finished = nil; callback?(false)
     }
@@ -216,7 +237,7 @@ final class Runner: ObservableObject {
         if let start = progressBuffer.firstIndex(of: "{") { progressBuffer = String(progressBuffer[start...]) }
         else if progressBuffer.utf8.count > 8192 { progressBuffer = String(progressBuffer.suffix(4096)) }
         output += clean
-        if output.count > 200000 { output = String(output.suffix(150000)) }
+        if output.count > 200000 { output = Self.trimmedSuffix(output, limit: 150000) }
         var history = log, line = currentLine
         for c in clean.replacingOccurrences(of: "\r\n", with: "\n") {
             if c == "\r" { pendingCR = true }
@@ -226,7 +247,7 @@ final class Runner: ObservableObject {
                 line.append(c)
             }
         }
-        log = history.count > 40000 ? String(history.suffix(30000)) : history
+        log = history.count > 40000 ? Self.trimmedSuffix(history, limit: 30000) : history
         currentLine = line.count > 8000 ? String(line.suffix(8000)) : line
         let prompt = InputPrompt.match(currentLine)
         if currentLine != submittedPromptLine || clean.contains("\n") || clean.contains("\r") { submittedPromptLine = nil }
@@ -254,29 +275,48 @@ final class Runner: ObservableObject {
         case nil: break
         }
     }
-    @MainActor func fileWork<T>(_ title: String, operation: @escaping () throws -> T) async -> Result<T, Error> {
+    @MainActor func fileWork<T>(_ title: String, preserveFailure: Bool = false, operation: @escaping () throws -> T) async -> Result<T, Error> {
+        let hadPriorFailure = busy && diagnostic?.hasFailedResult == true
+        let previousTitle = self.title
+        let previousHint = self.hint
         if !busy {
+            batchFailure = nil
             diagnostic = TaskDiagnostic(title: title, tool: "文件操作")
             diagnosticSecrets = []
             output = ""; log = ""
         }
         diagnostic?.stage(title)
-        busy = true; saving = true; inputPrompt = nil; self.title = title; progress = nil; hint = nil
+        busy = true; saving = true; inputPrompt = nil; self.title = title; progress = nil
+        if !(preserveFailure && hadPriorFailure) { hint = nil }
         Runner.active[id] = self
         let result = await Task.detached(priority: .userInitiated) { Result { try operation() } }.value
         updateCompletionState()
         switch result {
-        case .success: self.title = "操作完成"; diagnostic?.finish("成功")
-        case .failure: self.title = "操作失败"; diagnostic?.finish("失败")
+        case .success:
+            if preserveFailure && hadPriorFailure {
+                self.title = previousTitle
+                self.hint = previousHint
+            } else {
+                self.title = "操作完成"
+                diagnostic?.finish("成功")
+            }
+        case .failure(let error):
+            self.title = "操作失败"
+            if output.isEmpty { output = error.localizedDescription }
+            if log.isEmpty { log = error.localizedDescription + "\n" }
+            diagnostic?.finish("失败")
         }
         return result
     }
-    @MainActor func beginBatch(_ title: String) -> UUID? {
+    @MainActor func beginBatch(_ title: String, tool: String = "unfairplay") -> UUID? {
         guard !busy else { return nil }
         let token = UUID()
         batchID = token
         self.title = title
-        diagnostic = nil
+        var initial = TaskDiagnostic(title: title, tool: tool)
+        initial.stage("准备任务")
+        diagnostic = initial
+        batchFailure = nil
         diagnosticSecrets = []
         diagnosticPhase = ""
         output = ""; log = ""; currentLine = ""
@@ -285,8 +325,49 @@ final class Runner: ObservableObject {
         Runner.active[id] = self
         return token
     }
+    @MainActor func recordBatchFailure(_ stepTitle: String, detail: String) {
+        if batchID != nil {
+            if diagnostic == nil {
+                diagnostic = TaskDiagnostic(title: stepTitle, tool: "unfairplay")
+            }
+            diagnostic?.stage(stepTitle)
+            diagnostic?.finish("失败")
+            title = "操作失败"
+            hint = detail
+            output = output.isEmpty ? detail : Self.trimmedSuffix(output + "\n" + detail, limit: 150000)
+            log = log.isEmpty ? detail + "\n" : Self.trimmedSuffix(log + (log.hasSuffix("\n") ? "" : "\n") + detail + "\n", limit: 30000)
+            captureBatchFailure(itemTitle: stepTitle, detail: detail)
+        } else {
+            if diagnostic == nil {
+                diagnostic = TaskDiagnostic(title: stepTitle, tool: "UnfairPlay")
+            }
+            diagnostic?.stage(stepTitle)
+            diagnostic?.finish("失败")
+            if output.isEmpty { output = detail }
+            if log.isEmpty { log = detail + "\n" }
+        }
+    }
+    @MainActor func markDiagnosticFailure(_ stageName: String? = nil, detail: String? = nil) {
+        if let stageName, !stageName.isEmpty { diagnostic?.stage(stageName) }
+        diagnostic?.finish("失败")
+        if let detail, !detail.isEmpty, output.isEmpty { output = detail }
+    }
     @MainActor func finishBatch(_ token: UUID) {
         guard batchID == token, process == nil else { return }
+        if cancelled {
+            if diagnostic?.result != "已取消" { diagnostic?.finish("已取消") }
+        } else if let failure = batchFailure {
+            diagnostic = failure.diagnostic
+            output = failure.output
+            log = failure.log
+            for secret in failure.secrets where !diagnosticSecrets.contains(secret) {
+                diagnosticSecrets.append(secret)
+            }
+            title = "操作失败"
+        } else if diagnostic?.hasFailedResult != true {
+            diagnostic?.finish("成功")
+        }
+        batchFailure = nil
         batchID = nil
         holdsCompletion = false
         updateCompletionState()
@@ -312,6 +393,17 @@ final class Runner: ObservableObject {
         diagnostic?.stage(title)
     }
     func diagnosticReport(detail: String) -> String {
+        if let failure = batchFailure, diagnostic?.hasFailedResult != true {
+            var mergedSecrets = failure.secrets
+            for secret in diagnosticSecrets where !mergedSecrets.contains(secret) {
+                mergedSecrets.append(secret)
+            }
+            return failure.diagnostic.report(
+                detail: detail,
+                output: failure.output.isEmpty ? failure.log : failure.output,
+                secrets: mergedSecrets
+            )
+        }
         var record = diagnostic ?? TaskDiagnostic(title: "应用操作", tool: "UnfairPlay")
         if diagnostic == nil { record.finish("应用提示") }
         return record.report(detail: detail, output: output.isEmpty ? log : output, secrets: diagnosticSecrets)
@@ -320,5 +412,43 @@ final class Runner: ObservableObject {
         guard !privileged && !saving else { return }
         cancelled = true; inputPrompt = nil; process?.terminate()
         sessionKeyChannel?.cancel()
+    }
+
+    private func captureBatchFailure(itemTitle: String, detail: String? = nil) {
+        guard batchID != nil else { return }
+        var failedDiag = diagnostic ?? TaskDiagnostic(title: itemTitle, tool: "unfairplay")
+        if !failedDiag.hasFailedResult {
+            failedDiag.finish("失败")
+        }
+        let rawOut = output.isEmpty ? (detail ?? "") : output
+        let rawLog = log.isEmpty ? (rawOut.isEmpty ? "" : rawOut + "\n") : log
+        let labeledOut = rawOut.isEmpty ? "[\(itemTitle)]" : "[\(itemTitle)]\n\(rawOut)"
+        let labeledLog = rawLog.isEmpty ? "[\(itemTitle)]\n" : "[\(itemTitle)]\n\(rawLog)"
+
+        if var existing = batchFailure {
+            existing.diagnostic.stage("后续失败：\(itemTitle)")
+            existing.output = Self.trimmedSuffix(existing.output + "\n" + labeledOut, limit: 150000)
+            existing.log = Self.trimmedSuffix(existing.log + "\n" + labeledLog, limit: 30000)
+            for secret in diagnosticSecrets where !existing.secrets.contains(secret) {
+                existing.secrets.append(secret)
+            }
+            batchFailure = existing
+        } else {
+            batchFailure = BatchFailureSnapshot(
+                diagnostic: failedDiag,
+                output: rawOut,
+                log: rawLog,
+                secrets: diagnosticSecrets
+            )
+        }
+    }
+
+    private static func trimmedSuffix(_ text: String, limit: Int) -> String {
+        guard text.count > limit else { return text }
+        let tail = text.suffix(limit)
+        if let newline = tail.firstIndex(of: "\n"), tail.index(after: newline) < tail.endIndex {
+            return String(tail[tail.index(after: newline)...])
+        }
+        return String(tail)
     }
 }

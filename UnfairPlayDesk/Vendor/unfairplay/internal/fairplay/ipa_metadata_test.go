@@ -91,7 +91,13 @@ func TestInspectIPAFileArtworkFallback(t *testing.T) {
 		t.Fatal("app icon priority changed")
 	}
 	delete(members, "Payload/Test.app/AppIcon.png")
-	members["iTunesArtwork"] = bytes.Repeat([]byte("x"), (512<<10)+1)
+	largeValidIcon := bytes.Repeat([]byte("a"), (512<<10)+1024)
+	members["iTunesArtwork"] = largeValidIcon
+	writeMultiSINFArchive(t, filename, members)
+	if result := InspectIPAFile(filename); !bytes.Equal(result.Icon, largeValidIcon) {
+		t.Fatal("high-resolution artwork above 512 KiB rejected")
+	}
+	members["iTunesArtwork"] = bytes.Repeat([]byte("x"), maxIPAIconBytes+1)
 	writeMultiSINFArchive(t, filename, members)
 	if result := InspectIPAFile(filename); len(result.Icon) != 0 {
 		t.Fatal("oversized artwork accepted")

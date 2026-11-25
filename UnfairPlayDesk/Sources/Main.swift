@@ -60,9 +60,11 @@ struct ContentView: View {
     @ViewState var ipaBatchPosition: String?
     @ViewState var operationAccount = ""
     @ViewState var alertText: String?
+    @ViewState var noticeText: String?
     @ViewState var completionNotice: OperationNotice?
     @FocusState private var addIDFocused: Bool
     @ViewState var accountToClear: Profile?
+    @ViewState var clearLoginAccount: Profile?
     @ViewState var accountToLogin: Profile?
     @ViewState var appStoreAcquisitionURL: URL?
     @ViewState var accountsNeedingLogin = Set<UUID>()
@@ -148,6 +150,8 @@ struct ContentView: View {
         .onChange(of: appearance) { DeskAppearance.apply(appearance) }
         .onChange(of: page) { refreshIPAReferences() }
         .onChange(of: manuallyAddedIPAs) { UserDefaults.standard.set(manuallyAddedIPAs.map(\.path), forKey: "importedIPAPaths") }
+        .onChange(of: alertText) { if alertText != nil { selectedReport = nil } }
+        .onChange(of: store.error) { if store.error != nil { selectedReport = nil } }
         .sheet(item: $selectedReport) { IPAReportView(report: $0) }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             refreshIPAReferences()
@@ -202,33 +206,53 @@ struct ContentView: View {
             }.padding(24).frame(width: 380).onAppear { addIDFocused = true }
         }
         .sheet(isPresented: Binding(get: { runner.canReply && !showAddID && selectedReport == nil }, set: { presented in
-            if !presented && runner.canReply { runner.stop() }
+            if !presented && runner.canReply && !showAddID && selectedReport == nil { runner.stop() }
         })) {
             if let prompt = runner.inputPrompt {
                 CredentialSheet(prompt: prompt, account: operationAccount, submit: runner.reply, cancel: runner.stop)
                     .id(prompt).interactiveDismissDisabled()
             }
         }
-        .alert("提示", isPresented: Binding(get: { alertText != nil || store.error != nil }, set: { if !$0 {
-            alertText = nil; store.error = nil; accountToLogin = nil; appStoreAcquisitionURL = nil
-        } }), presenting: alertText ?? store.error) { detail in
-            if let url = appStoreAcquisitionURL {
-                Button("在 App Store 获取") { NSWorkspace.shared.open(url) }
-                Button("好", role: .cancel) { alertText = nil }
-            } else if let account = accountToLogin {
-                Button("重新登录") {
-                    accountToLogin = nil
-                    store.selected = account.id
-                    run("ipatool", ["auth", "login"], "正在重新登录“\(account.name)”", accountID: account.id)
-                }
-                Button("稍后", role: .cancel) { alertText = nil; accountToLogin = nil }
-            } else {
-                Button("好") { alertText = nil; store.error = nil }
+        .sheet(isPresented: Binding(
+            get: { (alertText != nil || store.error != nil) && !showAddID && selectedReport == nil && !runner.canReply },
+            set: { if !$0 && !showAddID && selectedReport == nil && !runner.canReply { dismissDiagnosticAlert() } }
+        )) {
+            if let detail = alertText ?? store.error {
+                DiagnosticAlertSheet(
+                    detail: detail,
+                    appStoreURL: appStoreAcquisitionURL,
+                    reloginAccount: accountToLogin,
+                    exportDiagnostic: { exportDiagnostic(detail) },
+                    openAppStore: { url in
+                        dismissDiagnosticAlert()
+                        NSWorkspace.shared.open(url)
+                    },
+                    relogin: { account in
+                        dismissDiagnosticAlert()
+                        store.selected = account.id
+                        run("ipatool", ["auth", "login"], "正在重新登录“\(account.name)”", accountID: account.id)
+                    },
+                    dismiss: dismissDiagnosticAlert
+                )
             }
-            Button("导出诊断…") { DispatchQueue.main.async { exportDiagnostic(detail) } }
-            Button("复制详情") {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(detail, forType: .string)
+        }
+        .alert("提示", isPresented: Binding(
+            get: { noticeText != nil },
+            set: { if !$0 { noticeText = nil; clearLoginAccount = nil } }
+        ), presenting: noticeText) { _ in
+            if let account = clearLoginAccount {
+                Button("重新登录") {
+                    clearLoginAccount = nil
+                    noticeText = nil
+                    store.selected = account.id
+                    login(account)
+                }
+                Button("稍后", role: .cancel) {
+                    clearLoginAccount = nil
+                    noticeText = nil
+                }
+            } else {
+                Button("好") { noticeText = nil }
             }
         } message: { detail in Text(detail) }
         .confirmationDialog("清除“\(accountToClear?.name ?? "")”的登录信息？", isPresented: $showClearConfirmation, titleVisibility: .visible) {
@@ -652,6 +676,12 @@ struct ContentView: View {
             }
         }.frame(maxWidth: 320, alignment: .trailing)
     }
+    func dismissDiagnosticAlert() {
+        alertText = nil
+        store.error = nil
+        accountToLogin = nil
+        appStoreAcquisitionURL = nil
+    }
     func exportDiagnostic(_ detail: String) {
         let report = runner.diagnosticReport(detail: detail)
         let panel = NSSavePanel()
@@ -664,7 +694,12 @@ struct ContentView: View {
             try Data(report.utf8).write(to: destination, options: .atomic)
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
         } catch {
-            alertText = "诊断导出失败：\(error.localizedDescription)"
+            let warning = NSAlert()
+            warning.alertStyle = .warning
+            warning.messageText = "诊断导出失败"
+            warning.informativeText = error.localizedDescription
+            warning.addButton(withTitle: "好")
+            warning.runModal()
         }
     }
     func showOperationFailure(_ title: String) {
@@ -678,7 +713,7 @@ struct ContentView: View {
         if let existing = store.profile(for: email) {
             store.selected = existing.id
             if existing.appleID == nil || existing.loginCleared == true || accountsNeedingLogin.contains(existing.id) { pendingLogin = existing }
-            else { alertText = "此 ID 已存在，已切换到原账户档案。" }
+            else { noticeText = "此 ID 已存在，已切换到原账户档案。" }
             showAddID = false; newAppleID = ""; profileName = ""
             return
         }
@@ -688,25 +723,23 @@ struct ContentView: View {
     }
     private func showLocalSessionStatus() {
         guard let account = store.selectedProfile else { return }
-        let url = store.root.appendingPathComponent("Sessions/\(account.id.uuidString.lowercased())/session-v1.enc")
-        let message: String
-        do {
-            if !canDownload { message = accountStatus(account) }
-            else if let stamp = try Core.fileStamp(url) {
-                message = stamp.mode & S_IFMT == S_IFREG && stamp.size > 0 ? "本地会话已保存" : "本地会话文件异常"
-            } else { message = "未找到本地会话文件" }
-        } catch { message = "无法读取本地会话状态" }
-        showCompletion(message, detail: account.appleID ?? account.requestedAppleID ?? account.name, duration: 2, symbol: "info.circle")
+        let message = Core.localSessionStatus(
+            accountID: account.id,
+            canDownload: canDownload,
+            fallbackStatus: accountStatus(account),
+            root: store.root
+        )
+        showCompletion(message, detail: account.appleID ?? account.requestedAppleID ?? account.name, duration: 3, symbol: "info.circle")
     }
     func login(_ account: Profile) {
         run("ipatool", ["auth", "login"], "正在登录“\(account.name)”", accountID: account.id)
     }
-    func run(_ name: String, _ args: [String], _ title: String, privileged: Bool = false, accountID: UUID? = nil, holdsCompletion: Bool = false, done: ((Bool)->Void)? = nil) {
+    func run(_ name: String, _ args: [String], _ title: String, privileged: Bool = false, accountID: UUID? = nil, holdsCompletion: Bool = false, suppressFailureAlert: Bool = false, done: ((Bool)->Void)? = nil) {
         operationAccount = store.profiles.first { $0.id == (accountID ?? store.selected) }?.name ?? ""
         guard name == "ipatool" else {
             guard store.canUseSelected else { alertText = "当前账户配置不可用或删除尚未完成。"; done?(false); return }
             runner.launch(tool(name), args, title: title, privileged: privileged, holdsCompletion: holdsCompletion) { ok in
-                if !ok { showOperationFailure(title) }
+                if !ok && !suppressFailureAlert { showOperationFailure(title) }
                 done?(ok)
             }
             return
@@ -725,7 +758,7 @@ struct ContentView: View {
         }
         if (arguments.first == "download" || arguments.first == "get-version-metadata"), let email = account.appleID { arguments += ["--expected-account", email] }
         if revoke { SessionKeyChannel.forget(id) }
-        runner.launch(tool("ipatool"), prefix + arguments, title: title, holdsCompletion: holdsCompletion, sessionAccount: id) { ok in
+        runner.launch(tool("ipatool"), prefix + arguments, title: title, holdsCompletion: holdsCompletion, sessionAccount: id, deletingSession: revoke) { ok in
             guard ok else {
                 let error = runner.output.lowercased()
                 if error.contains("encrypted account session failed authentication") { SessionKeyChannel.forget(id) }
@@ -746,6 +779,7 @@ struct ContentView: View {
                             if store.selected == id { syncAccountRegion() }
                         }
                     } catch {
+                        runner.markDiagnosticFailure("账户身份校验未通过", detail: error.localizedDescription)
                         alertText = error.localizedDescription; runner.title = "账户身份校验未通过"; done?(false); return
                     }
                 }
@@ -766,6 +800,7 @@ struct ContentView: View {
                         showCompletion("登录成功", detail: email)
                     }
                 } catch {
+                    runner.markDiagnosticFailure("账户身份校验未通过", detail: error.localizedDescription)
                     alertText = error.localizedDescription; runner.title = "账户身份校验未通过"; done?(false); return
                 }
             } else if let email = Core.email(in: runner.output) {
@@ -774,6 +809,7 @@ struct ContentView: View {
                     accountsNeedingLogin.remove(id)
                     if store.selected == id { syncAccountRegion() }
                 } catch {
+                    runner.markDiagnosticFailure("账户身份校验未通过", detail: error.localizedDescription)
                     alertText = error.localizedDescription; runner.title = "账户身份校验未通过"; done?(false); return
                 }
             }
@@ -783,16 +819,24 @@ struct ContentView: View {
     func clearLogin(_ account: Profile) {
         run("ipatool", ["auth", "revoke"], "正在清除“\(account.name)”的登录信息", accountID: account.id) { ok in
             guard ok else { return }
-            let cookies = store.root.appendingPathComponent("Sessions/\(account.id.uuidString.lowercased())/cookies")
+            let sessionDir = store.root.appendingPathComponent("Sessions/\(account.id.uuidString.lowercased())")
+            let cookies = sessionDir.appendingPathComponent("cookies")
+            let cookiesLock = sessionDir.appendingPathComponent("cookies.lock")
             do {
                 try store.markLoginCleared(account.id)
                 syncAccountRegion()
-                if FileManager.default.fileExists(atPath: cookies.path) { try FileManager.default.removeItem(at: cookies) }
+                if try Core.fileStamp(sessionDir) != nil {
+                    try Core.ordinaryDirectory(sessionDir)
+                    for item in [cookies, cookiesLock] where try Core.fileStamp(item) != nil {
+                        try FileManager.default.removeItem(at: item)
+                    }
+                }
                 runner.title = "“\(account.name)”的登录信息已清除"
-                accountToLogin = account
+                clearLoginAccount = account
                 accountsNeedingLogin.remove(account.id)
-                alertText = "“\(account.name)”的登录凭据和 Cookie 已清除，模型仍然保留。现在重新登录吗？"
+                noticeText = "“\(account.name)”的登录凭据和 Cookie 已清除，模型仍然保留。现在重新登录吗？"
             } catch {
+                runner.markDiagnosticFailure("清理 Cookie 失败", detail: error.localizedDescription)
                 alertText = "登录凭据已清除，但 Cookie 清理失败：\(error.localizedDescription)"
             }
         }
@@ -806,7 +850,7 @@ struct ContentView: View {
             store.refreshLegacyCount()
             switch outcome {
             case .success(let removed):
-                alertText = removed ? "“\(account.name)”的模型已移到废纸篓。登录信息仍然保留，可重新初始化或导入模型。" : "当前账户没有可删除的模型。"
+                noticeText = removed ? "“\(account.name)”的模型已移到废纸篓。登录信息仍然保留，可重新初始化或导入模型。" : "当前账户没有可删除的模型。"
             case .failure(let error): alertText = "删除模型失败：\(error.localizedDescription)"
             }
         }
@@ -827,12 +871,14 @@ struct ContentView: View {
                     }
                     DownloadedIPA.save(downloadedIPAs)
                     accountToLogin = nil
+                    clearLoginAccount = nil
                     accountsNeedingLogin.remove(account.id)
                     setupSelections.removeValue(forKey: account.id)
                     runner.log = ""; runner.currentLine = ""; runner.output = ""; operationAccount = ""
                     runner.title = "“\(account.name)”账户档案已删除"
-                    alertText = "“\(account.name)”的账户档案、登录信息、会话目录、模型目录和关联报告已彻底删除。"
+                    noticeText = "“\(account.name)”的账户档案、登录信息、会话目录、模型目录和关联报告已彻底删除。"
                 } catch {
+                    runner.markDiagnosticFailure("清理账户数据失败", detail: error.localizedDescription)
                     store.objectWillChange.send()
                     alertText = "该账户的登录凭据已清除，但档案删除未完成：\(error.localizedDescription)\n部分数据可能已清理，请检查后重试。"
                 }
@@ -850,7 +896,7 @@ struct ContentView: View {
     }
     func importModel() {
         guard !runner.busy else { return }
-        guard let dest = store.profileURL, store.canUseSelected, let accountID = store.selected else { alertText = "请先选择可用账户。"; return }
+        guard let dest = store.profileURL, store.canUseSelected, let accountID = store.selected else { noticeText = "请先选择可用账户。"; return }
         let panel = NSOpenPanel(); panel.canChooseDirectories = true; panel.canChooseFiles = false
         guard panel.runModal() == .OK, let source = panel.url else { return }
         let root = store.root
@@ -869,28 +915,36 @@ struct ContentView: View {
             switch prepared {
             case .failure(let error): alertText = error.localizedDescription
             case .success(let stage):
-                run("modelcheck", ["--model", stage.directory.path], "正在校验待导入模型", holdsCompletion: true) { ok in
+                run("modelcheck", ["--model", stage.directory.path], "正在校验待导入模型", holdsCompletion: true, suppressFailureAlert: true) { ok in
                     let output = runner.output
-                    let previousTitle = runner.title, previousHint = runner.hint
                     Task { @MainActor in
                         defer { runner.finishCompletion() }
+                        guard ok else {
+                            let cleaned = await runner.fileWork("正在清理临时文件…", preserveFailure: true) {
+                                try stage.cleanup()
+                            }
+                            store.refreshModel(force: true)
+                            showOperationFailure("正在校验待导入模型")
+                            if case .failure(let cleanupError) = cleaned {
+                                let message = "临时文件清理失败：\(cleanupError.localizedDescription)"
+                                runner.markDiagnosticFailure("临时文件清理失败", detail: message)
+                                alertText = alertText.map { $0 + "\n\n" + message } ?? message
+                            }
+                            return
+                        }
                         let eligible = store.selected == accountID && store.canUseSelected
                         let imported = await runner.fileWork("正在完成模型导入…") {
                             do {
-                                if ok {
-                                    guard eligible else { throw DeskError("账户已切换或不可修改，已取消导入。") }
-                                    let json = try JSONSerialization.jsonObject(with: Data(output.utf8)) as? [String: Any]
-                                    guard (json?["checks"] as? [String: Any])?["model_valid"] as? Bool == true else { throw DeskError("模型完整性校验失败，未导入文件。") }
-                                    try Core.installModels(stage.directory, to: dest)
-                                }
+                                guard eligible else { throw DeskError("账户已切换或不可修改，已取消导入。") }
+                                let json = try JSONSerialization.jsonObject(with: Data(output.utf8)) as? [String: Any]
+                                guard (json?["checks"] as? [String: Any])?["model_valid"] as? Bool == true else { throw DeskError("模型完整性校验失败，未导入文件。") }
+                                try Core.installModels(stage.directory, to: dest)
                             } catch { try? stage.cleanup(); throw error }
                             try stage.cleanup()
                         }
                         store.refreshModel(force: true)
-                        if !ok { runner.title = previousTitle; runner.hint = previousHint }
                         switch imported {
-                        case .success:
-                            if ok { showCompletion("模型已导入") }
+                        case .success: showCompletion("模型已导入")
                         case .failure(let error): alertText = error.localizedDescription
                         }
                     }
@@ -971,9 +1025,9 @@ struct ContentView: View {
                     defer {
                         do { try stage.cleanup() }
                         catch {
-                            accountToLogin = nil
-                            appStoreAcquisitionURL = nil
-                            alertText = "临时目录清理失败：\(error.localizedDescription)"
+                            let message = "临时目录清理失败：\(error.localizedDescription)"
+                            runner.markDiagnosticFailure("临时目录清理失败", detail: message)
+                            alertText = alertText.map { $0 + "\n\n" + message } ?? message
                         }
                         runner.finishCompletion()
                     }
@@ -998,8 +1052,12 @@ struct ContentView: View {
                                 ipaStatuses.removeValue(forKey: file)
                             }
                             ipaFolderRevision += 1
+                            showCompletion("IPA 已下载", detail: saved.lastPathComponent)
                         }
-                    } catch { alertText = error.localizedDescription }
+                    } catch {
+                        runner.markDiagnosticFailure("保存下载文件失败", detail: error.localizedDescription)
+                        alertText = error.localizedDescription
+                    }
                 }
             }
         } catch { alertText = error.localizedDescription }
@@ -1011,7 +1069,7 @@ struct ContentView: View {
                 let report = try await Task.detached(priority: .userInitiated) { try IPASavedReport.find(for: file, root: root) }.value
                 if !runner.canReply { selectedReport = report }
             }
-            catch { alertText = error.localizedDescription }
+            catch { noticeText = error.localizedDescription }
         }
     }
     @MainActor func saveCompletedIPA(_ temporary: URL, destination: Core.OutputTarget, protecting input: URL? = nil) async -> URL? {
@@ -1027,13 +1085,23 @@ struct ContentView: View {
                 alert.informativeText = "\(error.localizedDescription)\n可选择其他位置，无需重新处理。"
                 alert.addButton(withTitle: "另存为…")
                 alert.addButton(withTitle: "放弃结果")
-                guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+                guard alert.runModal() == .alertFirstButtonReturn else {
+                    runner.title = "已放弃保存结果"
+                    return nil
+                }
                 let panel = NSSavePanel()
                 panel.nameFieldStringValue = destination.url.lastPathComponent
                 panel.allowedContentTypes = [UTType(filenameExtension: "ipa") ?? .data]
                 if panel.runModal() == .OK, let url = panel.url {
                     do { destination = try Core.OutputTarget(url) }
-                    catch { alertText = error.localizedDescription }
+                    catch {
+                        let warning = NSAlert()
+                        warning.alertStyle = .warning
+                        warning.messageText = "无法使用所选保存位置"
+                        warning.informativeText = error.localizedDescription
+                        warning.addButton(withTitle: "好")
+                        warning.runModal()
+                    }
                 }
             }
         }
@@ -1076,18 +1144,76 @@ struct ContentView: View {
                 run("authorize", ["setup", "--app", app, "--ipa", stage.ipa.path, "--model-dir", model.path], "等待系统授权并初始化", privileged: true) { ok in
                     do { try stage.cleanup() } catch {
                         let message = "临时 IPA 清理失败：\(error.localizedDescription)"
+                        runner.markDiagnosticFailure("临时 IPA 清理失败", detail: message)
                         alertText = alertText.map { $0 + "\n\n" + message } ?? message
                     }
                     store.refreshModel(force: true)
                     if ok {
                         if Core.hasModel(model) { showCompletion("模型已初始化") }
-                        else { alertText = "模型基本检查未通过，请查看模型状态。" }
+                        else {
+                            runner.markDiagnosticFailure("模型基本检查未通过", detail: "模型基本检查未通过，请查看模型状态。")
+                            alertText = "模型基本检查未通过，请查看模型状态。"
+                        }
                     }
                 }
             }
         }
     }
 
+}
+
+private struct DiagnosticAlertSheet: View {
+    let detail: String
+    let appStoreURL: URL?
+    let reloginAccount: Profile?
+    let exportDiagnostic: () -> Void
+    let openAppStore: (URL) -> Void
+    let relogin: (Profile) -> Void
+    let dismiss: () -> Void
+    @ViewState private var copied = false
+
+    var body: some View {
+        VStack(spacing: 14) {
+            DeskSheetHeader(symbol: "exclamationmark.triangle", title: "操作提示",
+                            message: "可复制错误详情，或导出已脱敏的诊断报告。")
+            ScrollView {
+                Text(detail)
+                    .font(.system(size: 12))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(12)
+            .frame(minHeight: 72, maxHeight: 220)
+            .deskCard(cornerRadius: 10)
+            HStack(spacing: 10) {
+                Button("导出诊断…", action: exportDiagnostic)
+                Button(copied ? "已复制" : "复制详情") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(detail, forType: .string)
+                    copied = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
+                }
+                Spacer(minLength: 12)
+                if let url = appStoreURL {
+                    Button("好", role: .cancel, action: dismiss).keyboardShortcut(.cancelAction)
+                    Button("在 App Store 获取") { openAppStore(url) }
+                        .buttonStyle(DeskPrimaryButtonStyle(compact: true))
+                        .keyboardShortcut(.defaultAction)
+                } else if let account = reloginAccount {
+                    Button("稍后", role: .cancel, action: dismiss).keyboardShortcut(.cancelAction)
+                    Button("重新登录") { relogin(account) }
+                        .buttonStyle(DeskPrimaryButtonStyle(compact: true))
+                        .keyboardShortcut(.defaultAction)
+                } else {
+                    Button("好", action: dismiss)
+                        .buttonStyle(DeskPrimaryButtonStyle(compact: true))
+                        .keyboardShortcut(.defaultAction)
+                }
+            }
+        }
+        .padding(24)
+        .frame(width: 460)
+    }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {

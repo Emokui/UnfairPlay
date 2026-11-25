@@ -113,6 +113,24 @@ func TestDownloadArtworkRejectsFailedResponse(t *testing.T) {
 	}
 }
 
+func TestDownloadArtworkRejectsOversizedBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		chunk := make([]byte, 64<<10)
+		for written := 0; written <= maxArtworkBytes; written += len(chunk) {
+			if _, err := w.Write(chunk); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	store := &appstore{httpClient: newDownloadTestClient()}
+	if _, err := store.downloadArtwork(context.Background(), server.URL); err == nil {
+		t.Fatal("accepted oversized artwork response")
+	}
+}
+
 func TestFinalizationPreservesIPAWhenOptionalArtworkFails(t *testing.T) {
 	for _, rewriteFails := range []bool{false, true} {
 		name := "optional artwork"

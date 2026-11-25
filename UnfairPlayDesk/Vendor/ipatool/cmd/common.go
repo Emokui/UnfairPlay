@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	stdhttp "net/http"
+	stdcookiejar "net/http/cookiejar"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -27,6 +28,7 @@ import (
 
 var dependencies = Dependencies{}
 var keychainPassphrase string
+var activeStateDirectory string
 
 type Dependencies struct {
 	Logger    log.Logger
@@ -61,10 +63,39 @@ type sessionCookieJar struct {
 	dirty bool
 }
 
+type transientCookieJar struct {
+	*stdcookiejar.Jar
+}
+
+func (*transientCookieJar) Save() error { return nil }
+
+func openCookieJar(stateDirectory string, loadExisting bool) (http.CookieJar, error) {
+	if !loadExisting {
+		jar, err := stdcookiejar.New(nil)
+		if err != nil {
+			return nil, fmt.Errorf("initialize transient cookie jar: %w", err)
+		}
+		return &transientCookieJar{Jar: jar}, nil
+	}
+	filename := filepath.Join(stateDirectory, CookieJarFileName)
+	if info, err := os.Lstat(filename); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("cookie jar is not a regular file: %s", filename)
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("inspect cookie jar: %w", err)
+	}
+	jar, err := cookiejar.New(&cookiejar.Options{
+		Filename: filename,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("load cookie jar: %w", err)
+	}
+	return &sessionCookieJar{Jar: jar}, nil
+}
+
 func newCookieJar(stateDirectory string) http.CookieJar {
-	return &sessionCookieJar{Jar: util.Must(cookiejar.New(&cookiejar.Options{
-		Filename: filepath.Join(stateDirectory, CookieJarFileName),
-	}))}
+	return util.Must(openCookieJar(stateDirectory, true))
 }
 
 func (j *sessionCookieJar) SetCookies(url *url.URL, cookies []*stdhttp.Cookie) {
@@ -90,9 +121,24 @@ func (j *sessionCookieJar) Save() error {
 	return nil
 }
 
-// newKeychain returns a new keychain instance.
-func newKeychain(ctx context.Context, stateDirectory string, interactive bool, serviceName string) keychain.Keychain {
-	ring := util.Must(openKeyring(keyring.Config{
+func passphrasePromptTarget(prompt, fallback string) string {
+	if _, after, ok := strings.Cut(prompt, " unlock "); ok {
+		if target := strings.TrimSpace(after); target != "" {
+			return target
+		}
+	}
+	if trimmed := strings.TrimSpace(prompt); trimmed != "" {
+		return trimmed
+	}
+	return fallback
+}
+
+func isAuthRevokeCommand(cmd *cobra.Command) bool {
+	return cmd != nil && cmd.Name() == "revoke" && cmd.Parent() != nil && cmd.Parent().Name() == "auth"
+}
+
+func openSessionKeychain(ctx context.Context, stateDirectory string, interactive bool, serviceName string) (keychain.Keychain, error) {
+	ring, err := openKeyring(keyring.Config{
 		AllowedBackends: []keyring.BackendType{
 			keyring.KeychainBackend,
 			keyring.SecretServiceBackend,
@@ -110,7 +156,7 @@ func newKeychain(ctx context.Context, stateDirectory string, interactive bool, s
 				return keychainPassphrase, nil
 			}
 
-			path := strings.Split(s, " unlock ")[1]
+			path := passphrasePromptTarget(s, stateDirectory)
 			password, err := readPrompt(fmt.Sprintf("enter passphrase to unlock %s (this is separate from your Apple ID password): ", path), true)
 			if err != nil {
 				return "", fmt.Errorf("failed to read password: %w", err)
@@ -118,31 +164,43 @@ func newKeychain(ctx context.Context, stateDirectory string, interactive bool, s
 
 			return password, nil
 		},
-	}))
+	})
+	if err != nil {
+		return nil, fmt.Errorf("open credential keyring: %w", err)
+	}
 
 	legacy := keychain.New(keychain.Args{
 		Keyring: ring,
 		Label:   serviceName,
 	})
 	if sessionProfile == "" {
-		return legacy
+		return legacy, nil
 	}
 	if deskSessionFD >= 3 {
 		channel := os.NewFile(uintptr(deskSessionFD), "desktop-session")
 		if native, ok := ring.(interface{ desktopSessionFD(int) }); ok {
 			native.desktopSessionFD(deskSessionFD)
-			return keychain.NewDesktopSession(ctx, stateDirectory, serviceName, legacy, channel)
+			return keychain.NewDesktopSession(ctx, stateDirectory, serviceName, legacy, channel), nil
 		}
 		channel.Close()
 	}
-	return keychain.NewSession(ctx, stateDirectory, serviceName, legacy)
+	return keychain.NewSession(ctx, stateDirectory, serviceName, legacy), nil
+}
+
+// newKeychain returns a new keychain instance.
+func newKeychain(ctx context.Context, stateDirectory string, interactive bool, serviceName string) keychain.Keychain {
+	return util.Must(openSessionKeychain(ctx, stateDirectory, interactive, serviceName))
 }
 
 // initWithCommand initializes the dependencies of the command.
-func initWithCommand(cmd *cobra.Command) {
+func initWithCommand(cmd *cobra.Command) error {
+	activeStateDirectory = ""
 	verbose := cmd.Flag("verbose").Value.String() == "true"
 	interactive, _ := cmd.Context().Value(interactiveKey).(bool)
-	format := util.Must(OutputFormatFromString(cmd.Flag("format").Value.String()))
+	format, err := OutputFormatFromString(cmd.Flag("format").Value.String())
+	if err != nil {
+		return err
+	}
 
 	dependencies.Logger = newLogger(format, verbose)
 	if cmd.Name() == "mcp" {
@@ -154,22 +212,30 @@ func initWithCommand(cmd *cobra.Command) {
 	var stateDirectory string
 	serviceName := KeychainServiceName
 	if sessionProfile == "" {
-		stateDirectory = util.Must(prepareStateDirectory(dependencies.OS, dependencies.Machine.HomeDirectory()))
-	} else {
-		var err error
-		stateDirectory, serviceName, err = sessionNamespace(dependencies.Machine.HomeDirectory(), sessionProfile)
+		stateDirectory, err = prepareStateDirectory(dependencies.OS, dependencies.Machine.HomeDirectory())
 		if err != nil {
-			panic(err)
+			return err
 		}
-		if err := os.MkdirAll(stateDirectory, 0700); err != nil {
-			panic(err)
+		if info, statErr := os.Lstat(stateDirectory); statErr != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return fmt.Errorf("state directory is not an ordinary directory: %s", stateDirectory)
 		}
-		if err := os.Chmod(stateDirectory, 0700); err != nil {
-			panic(err)
+	} else {
+		stateDirectory, serviceName, err = prepareProfileSessionDirectory(dependencies.Machine.HomeDirectory(), sessionProfile)
+		if err != nil {
+			return err
 		}
 	}
-	dependencies.CookieJar = newCookieJar(stateDirectory)
-	dependencies.Keychain = newKeychain(cmd.Context(), stateDirectory, interactive, serviceName)
+	activeStateDirectory = stateDirectory
+	cookieJar, err := openCookieJar(stateDirectory, !isAuthRevokeCommand(cmd))
+	if err != nil {
+		return err
+	}
+	dependencies.CookieJar = cookieJar
+	kc, err := openSessionKeychain(cmd.Context(), stateDirectory, interactive, serviceName)
+	if err != nil {
+		return err
+	}
+	dependencies.Keychain = kc
 	dependencies.AppStore = appstore.NewAppStore(appstore.Args{
 		AuthenticationProgress: newStageReporter(),
 		CookieJar:              dependencies.CookieJar,
@@ -177,4 +243,5 @@ func initWithCommand(cmd *cobra.Command) {
 		Keychain:               dependencies.Keychain,
 		Machine:                dependencies.Machine,
 	})
+	return nil
 }

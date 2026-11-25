@@ -4,7 +4,7 @@
 <key>CFBundleName</key><string>UnfairPlay</string>
 <key>CFBundleDisplayName</key><string>UnfairPlay</string>
 <key>CFBundleIdentifier</key><string>local.unfairplay.desk</string>
-<key>CFBundleVersion</key><string>59</string>
+<key>CFBundleVersion</key><string>60</string>
 <key>CFBundleShortVersionString</key><string>1.5.8</string>
 <key>CFBundleIconFile</key><string>AppIcon</string>
 <key>CFBundleExecutable</key><string>UnfairPlayDesk</string>

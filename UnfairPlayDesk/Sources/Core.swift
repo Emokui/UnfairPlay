@@ -272,6 +272,47 @@ enum Core {
         return [title + "：未完成", hint, detail.map { String($0.prefix(650)) }]
             .compactMap { $0 }.joined(separator: "\n\n")
     }
+    static func hasLegacyKeychainSession(_ id: UUID) -> Bool {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "ipatool-auth.service." + id.uuidString.lowercased(),
+            kSecAttrAccount as String: "account",
+            kSecMatchLimit as String: kSecMatchLimitOne,
+            kSecUseAuthenticationUI as String: kSecUseAuthenticationUISkip
+        ]
+        let status = SecItemCopyMatching(query as CFDictionary, nil)
+        return status == errSecSuccess || status == errSecInteractionNotAllowed
+    }
+    static func localSessionStatus(
+        accountID: UUID,
+        canDownload: Bool,
+        fallbackStatus: String,
+        root: URL,
+        hasLegacyKeychainSession: (UUID) -> Bool = Core.hasLegacyKeychainSession
+    ) -> String {
+        guard canDownload else { return fallbackStatus }
+        let sessionDir = root.appendingPathComponent("Sessions/\(accountID.uuidString.lowercased())")
+        let encryptedSession = sessionDir.appendingPathComponent("session-v1.enc")
+        do {
+            if try fileStamp(sessionDir) != nil {
+                try ordinaryDirectory(sessionDir)
+            }
+            if let stamp = try fileStamp(encryptedSession) {
+                return (stamp.mode & S_IFMT) == S_IFREG && stamp.size > 0 ? "本地会话已保存" : "本地会话文件异常"
+            }
+            let legacyFile = sessionDir.appendingPathComponent("account")
+            if let legacyStamp = try fileStamp(legacyFile),
+               (legacyStamp.mode & S_IFMT) == S_IFREG && legacyStamp.size > 0 {
+                return "旧版会话待首次使用时迁移"
+            }
+            if hasLegacyKeychainSession(accountID) {
+                return "旧版会话待首次使用时迁移"
+            }
+            return "未找到本地会话文件"
+        } catch {
+            return "无法读取本地会话状态"
+        }
+    }
     static func isMissingSession(in lowercaseError: String) -> Bool {
         (lowercaseError.contains("keyring") || lowercaseError.contains("failed to get account")) &&
             (lowercaseError.contains("not be found") || lowercaseError.contains("not found") || lowercaseError.contains("no such file"))
@@ -279,6 +320,9 @@ enum Core {
     static func errorHint(_ text: String) -> String {
         let value = text.lowercased()
         if value.contains("read macos keychain item") { return "钥匙串读取未获授权，请在系统弹窗中允许访问后重试。" }
+        if value.contains("cookie jar") || value.contains("cookiejar") {
+            return "此账户的本地 Cookie 已损坏，请在账户菜单清除此账户登陆，再重新登录。"
+        }
         if value.contains("encrypted account session") || value.contains("account session key is") {
             return "此账户的加密会话或密钥不可用，请在账户菜单清除此账户登陆，再重新登录。"
         }

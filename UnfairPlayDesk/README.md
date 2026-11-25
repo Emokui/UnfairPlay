@@ -9,7 +9,7 @@ UnfairPlay 是面向 Apple 芯片 Mac 的 App Store 应用搜索、IPA 下载与
 退出旧版本后，从「应用程序」打开 UnfairPlay。升级时沿用已有账户档案与模型。
 
 - **添加新 ID**：输入 Apple ID 和可选名称，自动创建独立档案并进入登录。需要密码或验证码时，使用弹窗输入。登录成功后保存返回的真实 Apple ID；重新登录会使用绑定身份，下载前也会核对身份。重复或不匹配的身份会被拒绝。
-- **查看状态**：账户菜单显示本地登录状态。会话已保存只表示本地存在会话文件，令牌有效性由实际账户操作确认。
+- **查看状态**：账户菜单显示本地登录状态。会话已保存表示本地存在加密会话文件；旧版升级后尚未触发迁移的账户会提示待首次使用时迁移，令牌有效性由实际账户操作确认。
 - **切换账户**：选择账户档案即可复用对应会话。不同 UUID 的钥匙串项目、Cookie 和模型独立；不会替你切换系统 Mac App Store。
 - **搜索与下载**：搜索应用或粘贴 App Store 链接、数字 ID，选择版本与保存位置。缺少许可时自动尝试免费获取；付费应用需先用同一 ID 购买。`license is required` 表示当前 ID 仍未取得许可，界面会给出中文处理建议。
 - **初始化模型**：先在 Mac App Store 登录相应账户，安装并打开一个支持 Mac 的 iPhone/iPad 应用，再选择该应用和对应账户下载的匹配 IPA。管理员授权由 macOS 提示。系统构建是否受支持由内置工具校验，不能强行跳过。
@@ -54,7 +54,7 @@ UnfairPlay 是面向 Apple 芯片 Mac 的 App Store 应用搜索、IPA 下载与
 Go 测试（在 `Vendor/ipatool` 运行）：
 
 ```sh
-go test -count=1 ./cmd ./pkg/keychain ./pkg/http ./pkg/appstore ./internal/store ./internal/store/emulator ./internal/store/profile ./internal/storeauth ./internal/sap/assets ./internal/sap/machimage ./internal/sap/machine ./internal/sap/unicorn
+go test -count=1 ./cmd ./pkg/keychain ./pkg/http ./pkg/appstore ./internal/cachelock ./internal/store ./internal/store/emulator ./internal/store/profile ./internal/storeauth ./internal/sap/assets ./internal/sap/machimage ./internal/sap/machine ./internal/sap/unicorn
 ```
 
 软件包只读自检：

@@ -22,12 +22,14 @@
 #define ROOT_HELPER_SHA256 "unconfigured"
 #endif
 
+#if defined(DESK_ROOT_ONLY) || defined(main)
 static int configureInvokingUser(uid_t uid) {
     struct passwd *pw = getpwuid(uid);
     if (!pw || uid == 0) return 0;
     char a[32], b[32]; snprintf(a,sizeof(a),"%u",uid); snprintf(b,sizeof(b),"%u",pw->pw_gid);
     return !setenv("SUDO_USER",pw->pw_name,1) && !setenv("SUDO_UID",a,1) && !setenv("SUDO_GID",b,1);
 }
+#endif
 static int validUUID(const char *s) {
     if (strlen(s) != 36) return 0;
     for (int i=0;i<36;i++) if (i==8||i==13||i==18||i==23) { if(s[i]!='-')return 0; } else if(!isxdigit((unsigned char)s[i]))return 0;
@@ -75,6 +77,7 @@ static int trustedBinary(const char *path, const char *expectedHash) {
     if(code)CFRelease(code); CFRelease(url); return result==errSecSuccess;
 }
 static int trustedTool(const char *path) { return trustedBinary(path, UNFAIRPLAY_SHA256); }
+#if defined(DESK_ROOT_ONLY) || defined(main)
 static int removeTemporary(const char *path, const struct stat *state, int kind, struct FTW *walk) {
     (void)state; (void)walk;
     return kind == FTW_DP ? rmdir(path) : unlink(path);
@@ -92,6 +95,7 @@ static int runRoot(const char *tool, char **args, pid_t parent) {
     kill(-child,SIGTERM);
     return WIFEXITED(status)?WEXITSTATUS(status):128+WTERMSIG(status);
 }
+#endif
 #ifndef DESK_ROOT_ONLY
 static char *shellQuote(const char *value) {
     size_t length=strlen(value); char *quoted=malloc(length*4+3), *out=quoted;

@@ -9,6 +9,8 @@ import (
 	"time"
 )
 
+const maxArtworkBytes = 8 << 20
+
 func (t *appstore) downloadArtwork(ctx context.Context, url string) ([]byte, error) {
 	if url == "" {
 		return nil, nil
@@ -36,9 +38,17 @@ func (t *appstore) downloadArtwork(ctx context.Context, url string) ([]byte, err
 		return nil, fmt.Errorf("unexpected artwork response status: %d", res.StatusCode)
 	}
 
-	data, err := io.ReadAll(res.Body)
+	if res.ContentLength > maxArtworkBytes {
+		return nil, fmt.Errorf("artwork exceeds maximum size (%d bytes)", maxArtworkBytes)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(res.Body, maxArtworkBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read artwork: %w", err)
+	}
+
+	if len(data) > maxArtworkBytes {
+		return nil, fmt.Errorf("artwork exceeds maximum size (%d bytes)", maxArtworkBytes)
 	}
 
 	if len(data) == 0 {

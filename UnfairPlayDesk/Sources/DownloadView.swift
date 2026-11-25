@@ -187,7 +187,7 @@ extension ContentView {
         }
         showDownloads = false
         guard let airDrop = NSSharingService(named: .sendViaAirDrop), airDrop.canPerform(withItems: [url]) else {
-            alertText = "AirDrop 当前不可用。"
+            noticeText = "AirDrop 当前不可用。"
             return
         }
         airDrop.perform(withItems: [url])

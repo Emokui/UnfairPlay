@@ -39,8 +39,7 @@ func rootCmd() *cobra.Command {
 			}
 			ctx := context.WithValue(cmd.Context(), interactiveKey, !nonInteractive)
 			cmd.SetContext(ctx)
-			initWithCommand(cmd)
-			return nil
+			return initWithCommand(cmd)
 		},
 	}
 

@@ -34,11 +34,11 @@ for binary in "$APP/Contents/Resources/Tools/modelcheck" "$APP/Contents/Resource
   codesign --force --sign "$SIGNING_IDENTITY" --identifier "local.unfairplay.${binary:t}" "$binary"
 done
 TOOL_SHA="$(shasum -a 256 "$APP/Contents/Resources/Tools/unfairplay" | cut -d ' ' -f 1)"
-clang -mmacosx-version-min=14.0 -Wno-deprecated-declarations -DDESK_ROOT_ONLY -DUNFAIRPLAY_SHA256=\"${TOOL_SHA}\" Sources/authorize.c -framework Security -framework CoreFoundation -o build/root-helper
+clang -mmacosx-version-min=14.0 -Wall -Wextra -Wno-deprecated-declarations -DDESK_ROOT_ONLY -DUNFAIRPLAY_SHA256=\"${TOOL_SHA}\" Sources/authorize.c -framework Security -framework CoreFoundation -o build/root-helper
 codesign --force --sign "$SIGNING_IDENTITY" --identifier local.unfairplay.root-helper build/root-helper
 ROOT_SHA="$(shasum -a 256 build/root-helper | cut -d ' ' -f 1)"
-clang -mmacosx-version-min=14.0 -Wno-deprecated-declarations -DROOT_HELPER_SHA256=\"${ROOT_SHA}\" -DUNFAIRPLAY_SHA256=\"${TOOL_SHA}\" Sources/authorize.c -framework Security -framework CoreFoundation -o build/authorize
-clang -mmacosx-version-min=14.0 Sources/worker.c -o build/worker
+clang -mmacosx-version-min=14.0 -Wall -Wextra -Wno-deprecated-declarations -DROOT_HELPER_SHA256=\"${ROOT_SHA}\" -DUNFAIRPLAY_SHA256=\"${TOOL_SHA}\" Sources/authorize.c -framework Security -framework CoreFoundation -o build/authorize
+clang -mmacosx-version-min=14.0 -Wall -Wextra Sources/worker.c -o build/worker
 xcrun swiftc -target arm64-apple-macos14.0 -swift-version 5 -O -parse-as-library Sources/*.swift -o build/UnfairPlayDesk -framework SwiftUI -framework AppKit -framework Security -module-cache-path build/module-cache
 cp build/UnfairPlayDesk "$APP/Contents/MacOS/UnfairPlayDesk"
 cp build/root-helper build/authorize build/worker "$APP/Contents/Resources/Tools/"

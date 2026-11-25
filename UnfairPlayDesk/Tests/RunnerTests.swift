@@ -1,5 +1,7 @@
 import Foundation
+import CryptoKit
 import Darwin
+import Security
 
 @main struct Tests {
     static func model(_ url: URL, seed: UInt8 = 0) throws {
@@ -125,17 +127,49 @@ import Darwin
 
         let reportDirectory = root.appendingPathComponent("report-fixture/Reports")
         try Core.privateDirectory(reportDirectory)
+        let reportInput = root.appendingPathComponent("synthetic-input.ipa")
         let reportOutput = root.appendingPathComponent("synthetic-result.ipa")
+        let inputBytes = Data("synthetic-encrypted-input".utf8)
+        let outputBytes = Data("synthetic-decrypted-output".utf8)
+        try inputBytes.write(to: reportInput)
+        try outputBytes.write(to: reportOutput)
+        let inputSHA = SHA256.hash(data: inputBytes).map { String(format: "%02x", $0) }.joined()
+        let outputSHA = SHA256.hash(data: outputBytes).map { String(format: "%02x", $0) }.joined()
         let reportJSON: [String: Any] = [
-            "input": ["path": root.appendingPathComponent("synthetic-input.ipa").path, "sha256": "input-hash"],
-            "output": ["path": reportOutput.path, "sha256": "output-hash"],
+            "input": ["path": reportInput.path, "sha256": inputSHA],
+            "output": ["path": reportOutput.path, "sha256": outputSHA],
             "complete": true, "plaintext_verified": false,
             "images": [["member": "Payload/Test.app/Test", "first_page_audit": "arm64-instruction-decode"]]
         ]
         try Core.writeJSON(reportJSON, to: reportDirectory.appendingPathComponent("synthetic.json"))
-        let savedReport = try IPASavedReport.find(for: reportOutput, root: reportDirectory.deletingLastPathComponent())
-        precondition(savedReport.document.output.sha256 == "output-hash")
+        let reportRoot = reportDirectory.deletingLastPathComponent()
+        let savedReport = try IPASavedReport.find(for: reportOutput, root: reportRoot)
+        precondition(savedReport.document.output.sha256 == outputSHA)
         precondition(savedReport.document.images?.first?.auditDescription == "ARM64 指令结构审计")
+        let savedInputReport = try IPASavedReport.find(for: reportInput, root: reportRoot)
+        precondition(savedInputReport.url == savedReport.url)
+        let movedReportOutput = root.appendingPathComponent("moved-archive-result.ipa")
+        try outputBytes.write(to: movedReportOutput)
+        let movedReport = try IPASavedReport.find(for: movedReportOutput, root: reportRoot)
+        precondition(movedReport.url == savedReport.url && movedReport.document.output.sha256 == outputSHA)
+        try Data("overwritten-different-ipa".utf8).write(to: reportOutput)
+        do {
+            _ = try IPASavedReport.find(for: reportOutput, root: reportRoot)
+            preconditionFailure("must reject stale report when IPA SHA-256 no longer matches")
+        } catch {
+            precondition(error.localizedDescription.contains("匹配"))
+        }
+        try inputBytes.write(to: reportOutput)
+        do {
+            _ = try IPASavedReport.find(for: reportOutput, root: reportRoot)
+            preconditionFailure("must reject output path whose bytes no longer match output SHA-256")
+        } catch {
+            precondition(error.localizedDescription.contains("匹配"))
+        }
+        do {
+            _ = try IPASavedReport.find(for: root.appendingPathComponent("nonexistent-report-target.ipa"), root: reportRoot)
+            preconditionFailure("must reject nonexistent IPA when looking up report")
+        } catch {}
         precondition(Core.appID("https://apps.apple.com/jp/app/test/id6474479684?l=ja") == "6474479684")
         precondition(Core.appID("6474479684") == "6474479684")
         precondition(Core.appID("https://evil.example/id123") == nil && Core.appID("0") == nil)
@@ -691,8 +725,286 @@ import Darwin
         precondition(Core.errorHint("AppleMediaServices returned no Store AMD proof (<nil>)").contains("商店设备认证信息"))
         precondition(Core.errorHint("version metadata account does not match selected profile").contains("所选账户不一致"))
         precondition(Core.errorHint("failed to refresh Apple login: password is required to sign in").contains("登录会话已过期"))
+        precondition(Core.errorHint("load cookie jar: unexpected end of JSON input").contains("Cookie"))
         precondition(Core.email(in: "{\"success\":true,\"email\":\"A@Example.com\"}") == "a@example.com")
         print("PASS: abandoned staging recovery, account email parsing and actionable Chinese error hints")
+
+        // TaskDiagnostic redaction & whitelist regression coverage
+        var diag = TaskDiagnostic(title: "合成诊断测试", tool: "unfairplay")
+        diag.stage("准备环境")
+        diag.finish("失败", exitStatus: 1)
+        let multiLineAndEscaped = """
+        {"level":"error","message":"Get \\"https://bag.itunes.apple.com/bag.xml?secret=abc\\": open \\"/Users/alice_secret/Downloads/App.ipa\\": failed, token=\\"bearer secret\\", email=alice_secret@example.com, phone=+8613812345678","unlisted_field":"MUST_NOT_APPEAR_SINGLE"}
+        raw escaped slash: {"not_valid_tail": \\/Users\\/bob_secret\\/file and https:\\/\\/evil.example\\/leak?x=1\\" end
+        {
+          "PlaintextVerified": true,
+          "OutputPath": "/Users/charlie_secret/App.decrypted.ipa",
+          "LogicalKeySHA256": "SECRET_LOGICAL_KEY_HASH",
+          "LogicalKeySHA256BySINF": {
+            "Payload/App.app/SC_Info/App.sinf": "SECRET_SINF_HASH"
+          },
+          "success": true
+        }
+        [
+          {
+            "path": "/Users/dave_secret/App.ipa",
+            "icon": "BASE64_ICON_LEAK",
+            "selector_ids": ["00000001:00000002"]
+          }
+        ]
+        """
+        let quotedSecret = #"my"complex\secret/val"#
+        let renderedDiag = diag.report(
+            detail: "操作错误：\(NSHomeDirectory())/Downloads password=\"inline-pass\" custom=\(quotedSecret)",
+            output: multiLineAndEscaped + "\n{\"message\":\"echo my\\\"complex\\\\secret/val\"}",
+            secrets: [quotedSecret]
+        )
+        for forbidden in [
+            "MUST_NOT_APPEAR_SINGLE", "SECRET_LOGICAL_KEY_HASH", "SECRET_SINF_HASH",
+            "BASE64_ICON_LEAK", "LogicalKeySHA256", "OutputPath", "selector_ids",
+            "alice_secret", "bob_secret", "charlie_secret", "dave_secret",
+            "bag.itunes.apple.com", "evil.example", "bearer secret", "inline-pass",
+            "13812345678", quotedSecret, #"my\"complex\\secret/val"#
+        ] {
+            precondition(!renderedDiag.contains(forbidden), "TaskDiagnostic leaked \(forbidden)")
+        }
+        precondition(renderedDiag.contains(#"\"[URL]\""#) && renderedDiag.contains(#"\"/Users/[用户]/Downloads/App.ipa\""#))
+        precondition(renderedDiag.contains(#"{"success":true}"#) && renderedDiag.contains("~/Downloads"))
+
+        // 24,000-char boundary must not split JSON and bypass allowedFields
+        let boundaryJSON = #"{"message":"boundary-kept","forbidden_24k":"LEAK_ACROSS_24K_BOUNDARY","padding":""# + String(repeating: "p", count: 4000) + #"}"#
+        let fillerLines = Array(repeating: "plain filler line 12345", count: 950).joined(separator: "\n")
+        let boundaryReport = diag.report(detail: "边界测试", output: boundaryJSON + "\n" + fillerLines, secrets: [])
+        precondition(!boundaryReport.contains("LEAK_ACROSS_24K_BOUNDARY") && !boundaryReport.contains("forbidden_24k"))
+        let recentMarker = "最近输出（最多 24,000 字符）\n"
+        if let markerRange = boundaryReport.range(of: recentMarker) {
+            let recentSection = boundaryReport[markerRange.upperBound...].dropLast()
+            precondition(recentSection.count <= 24_000)
+        } else {
+            preconditionFailure("missing recent output header")
+        }
+
+        // Head-truncated JSON (e.g. pre-sliced buffer) and EOF-unclosed multi-line JSON
+        let preTruncatedSingle = #"chopped_prefix","secret_head":"HEAD_SINGLE_LEAK","message":"head-ok"}"# + "\nplain-after"
+        let preTruncatedReport = diag.report(detail: "截断测试", output: preTruncatedSingle, secrets: [])
+        precondition(!preTruncatedReport.contains("HEAD_SINGLE_LEAK") && !preTruncatedReport.contains("chopped_prefix"))
+        precondition(preTruncatedReport.contains(#"{"message":"head-ok"}"#) && preTruncatedReport.contains("plain-after"))
+
+        let unclosedEOF = "{\n  \"LogicalKeySHA256\": \"UNCLOSED_EOF_LEAK\",\n  \"message\": \"eof-kept\""
+        let unclosedReport = diag.report(detail: "未闭合JSON", output: unclosedEOF, secrets: [])
+        precondition(!unclosedReport.contains("UNCLOSED_EOF_LEAK") && unclosedReport.contains(#"{"message":"eof-kept"}"#))
+        let concatAndOrphan = #"{"secret1":"CONCAT_LEAK_1"}{"message":"concat-kept","secret2":"CONCAT_LEAK_2"}"# + "\n  \"orphan_secret\": \"ORPHAN_PROP_LEAK\","
+        let concatReport = diag.report(detail: "拼接JSON", output: concatAndOrphan, secrets: [])
+        precondition(!concatReport.contains("CONCAT_LEAK_1") && !concatReport.contains("CONCAT_LEAK_2") && !concatReport.contains("ORPHAN_PROP_LEAK"))
+        precondition(concatReport.contains(#"{"message":"concat-kept"}"#))
+
+        // Adversarial JSON edge cases: nested head-truncated JSON, inline + broken trailing JSON, interrupted JSON, and Go \u00XX escapes
+        let nestedHeadTrunc = #"chopped_prefix","message":"head-nested-kept","nested":{"a":1},"secret_tail":"TAIL_SECRET_LEAK_BYPASS"}"#
+        let inlineBrokenTail = #"{"message":"step1","secretA":"LEAK_INLINE_A"}{"secretB":"LEAK_INLINE_B","message":"step2""#
+        let singleUnclosedMid = #"{"LogicalKeySHA256":"LEAK_SINGLE_UNCLOSED","message":"starting-mid""# + "\nError: connection reset"
+        let interruptedMulti = "{\n  \"LogicalKeySHA256\": \"LEAK_MULTI_INTERRUPTED\",\n  \"elem_secret_val\",\n  \"message\": \"interrupted-ok\"\nworker: child killed"
+        let prefixedInline = #"2026-11-25 helper failed: {"code":500,"secret_p":"LEAK_PREFIX_JSON","message":"prefixed-msg"}"#
+        let goUnicodeEscaped = #"request failed: "https://itunes.apple.com/buy?guid=111\u0026secret_query=SUPER_SECRET_QUERY" secret=my\u0026pass\u003c1\u003e"#
+        let adversarialInput = [nestedHeadTrunc, inlineBrokenTail, singleUnclosedMid, interruptedMulti, prefixedInline, goUnicodeEscaped].joined(separator: "\n")
+        let adversarialReport = diag.report(detail: "对抗测试", output: adversarialInput, secrets: ["my&pass<1>"])
+        for leaked in [
+            "TAIL_SECRET_LEAK_BYPASS", "secret_tail", "LEAK_INLINE_A", "LEAK_INLINE_B",
+            "LEAK_SINGLE_UNCLOSED", "LEAK_MULTI_INTERRUPTED", "elem_secret_val",
+            "LEAK_PREFIX_JSON", "SUPER_SECRET_QUERY", "my&pass<1>", #"my\u0026pass"#
+        ] {
+            precondition(!adversarialReport.contains(leaked), "Adversarial TaskDiagnostic leaked \(leaked)")
+        }
+        for preserved in [
+            "head-nested-kept", "step1", "step2", "starting-mid", "Error: connection reset",
+            "interrupted-ok", "worker: child killed", "2026-11-25 helper failed:", "prefixed-msg"
+        ] {
+            precondition(adversarialReport.contains(preserved), "Adversarial TaskDiagnostic lost \(preserved)")
+        }
+        print("PASS: TaskDiagnostic slash/quote redaction, multi-line & 24K-boundary JSON whitelist enforcement")
+
+        if let ipatoolPath = ProcessInfo.processInfo.environment["DESK_IPATOOL"] {
+            let isolatedHome = root.appendingPathComponent("corrupt-revoke-home")
+            let revokeAccountID = UUID()
+            let revokeSessionDir = isolatedHome.appendingPathComponent("Library/Application Support/UnfairPlayDesk/Sessions/\(revokeAccountID.uuidString.lowercased())")
+            try Core.privateDirectory(revokeSessionDir)
+            let corruptCookies = revokeSessionDir.appendingPathComponent("cookies")
+            let corruptSession = revokeSessionDir.appendingPathComponent("session-v1.enc")
+            let corruptGoCookies = isolatedHome.appendingPathComponent("corrupt-go-cookies")
+            try Data("{{{corrupt-cookies".utf8).write(to: corruptCookies)
+            try Data("corrupt-session-bytes".utf8).write(to: corruptSession)
+            try Data("{{{corrupt-default-gocookies".utf8).write(to: corruptGoCookies)
+            let previousHome = getenv("HOME").map { String(cString: $0) }
+            let previousGoCookies = getenv("GOCOOKIES").map { String(cString: $0) }
+            setenv("HOME", isolatedHome.path, 1)
+            setenv("GOCOOKIES", corruptGoCookies.path, 1)
+            defer {
+                if let previousHome { setenv("HOME", previousHome, 1) } else { unsetenv("HOME") }
+                if let previousGoCookies { setenv("GOCOOKIES", previousGoCookies, 1) } else { unsetenv("GOCOOKIES") }
+            }
+            let revokeRunner = Runner(verify: {})
+            let revokeOK = await withCheckedContinuation { continuation in
+                revokeRunner.launch(
+                    URL(fileURLWithPath: ipatoolPath),
+                    ["--profile", revokeAccountID.uuidString, "--format", "json", "auth", "revoke"],
+                    title: "清除损坏会话",
+                    sessionAccount: revokeAccountID,
+                    deletingSession: true
+                ) { continuation.resume(returning: $0) }
+            }
+            precondition(revokeOK, "ipatool auth revoke failed under corrupt cookies: \(revokeRunner.output)")
+            precondition(!fm.fileExists(atPath: corruptCookies.path) && !fm.fileExists(atPath: corruptSession.path))
+            print("PASS: end-to-end ipatool auth revoke succeeds and cleans up corrupt cookies and corrupt encrypted session")
+        }
+
+        // Diagnostic preservation across post-failure cleanup and partial-failure batches
+        let diagRunner = Runner(verify: {})
+        let failedModelCheck = await withCheckedContinuation { continuation in
+            diagRunner.launch(URL(fileURLWithPath: "/bin/zsh"), ["-c", "printf 'error: synthetic modelcheck failure\\n'; exit 3"], title: "正在校验待导入模型", holdsCompletion: true) {
+                continuation.resume(returning: $0)
+            }
+        }
+        precondition(!failedModelCheck && diagRunner.busy)
+        let cleanupOutcome = await diagRunner.fileWork("正在清理临时文件…", preserveFailure: true) { () }
+        guard case .success = cleanupOutcome else { preconditionFailure("cleanup failed") }
+        diagRunner.finishCompletion()
+        let preservedModelDiag = diagRunner.diagnosticReport(detail: "导入失败")
+        precondition(preservedModelDiag.contains("结果  失败") && preservedModelDiag.contains("退出码  3") && preservedModelDiag.contains("synthetic modelcheck failure"))
+
+        // Pre-launch batch staging failure diagnostic context
+        let stageBatchRunner = Runner(verify: {})
+        let stageBatchToken = stageBatchRunner.beginBatch("正在解密 IPA")!
+        stageBatchRunner.recordStage("正在准备 broken.ipa")
+        stageBatchRunner.recordBatchFailure("处理 broken.ipa 失败", detail: "synthetic staging permission error")
+        stageBatchRunner.finishBatch(stageBatchToken)
+        let stageFailReport = stageBatchRunner.diagnosticReport(detail: "暂存失败")
+        precondition(stageFailReport.contains("结果  失败") && !stageFailReport.contains("结果  应用提示") && stageFailReport.contains("synthetic staging permission error"))
+
+        // Recovered Save As retry inside single-file batch must not poison final batch result,
+        // and post-tool recordBatchFailure must preserve prior tool output & stages
+        let saveRetryRunner = Runner(verify: {})
+        let saveRetryToken = saveRetryRunner.beginBatch("正在解密 IPA")!
+        let decryptOK = await withCheckedContinuation { continuation in
+            saveRetryRunner.launch(URL(fileURLWithPath: "/bin/zsh"), ["-c", "printf 'decrypt engine ok\\n'; exit 0"], title: "正在解密 retry.ipa", holdsCompletion: true, batchID: saveRetryToken) {
+                continuation.resume(returning: $0)
+            }
+        }
+        precondition(decryptOK)
+        let firstSaveAttempt = await saveRetryRunner.saveFile { throw DeskError("transient save target busy") }
+        if case .success = firstSaveAttempt { preconditionFailure("expected first save to fail") }
+        let secondSaveAttempt = await saveRetryRunner.saveFile { () }
+        guard case .success = secondSaveAttempt else { preconditionFailure("expected retry save to succeed") }
+        saveRetryRunner.finishCompletion()
+        saveRetryRunner.finishBatch(saveRetryToken)
+        let retryDiagReport = saveRetryRunner.diagnosticReport(detail: "重试保存完成")
+        precondition(retryDiagReport.contains("结果  成功") && saveRetryRunner.title != "操作失败")
+
+        let postToolFailRunner = Runner(verify: {})
+        let postToolToken = postToolFailRunner.beginBatch("正在解密 IPA")!
+        let toolSucceeded = await withCheckedContinuation { continuation in
+            postToolFailRunner.launch(URL(fileURLWithPath: "/bin/zsh"), ["-c", "printf 'engine stdout context\\n'; exit 0"], title: "正在解密 postfail.ipa", holdsCompletion: true, batchID: postToolToken) {
+                continuation.resume(returning: $0)
+            }
+        }
+        precondition(toolSucceeded)
+        postToolFailRunner.recordBatchFailure("写入 postfail.ipa 解密报告失败", detail: "report disk full")
+        postToolFailRunner.finishCompletion()
+        postToolFailRunner.finishBatch(postToolToken)
+        let postToolDiag = postToolFailRunner.diagnosticReport(detail: "报告写入失败")
+        precondition(postToolDiag.contains("结果  失败") && postToolDiag.contains("engine stdout context") && postToolDiag.contains("report disk full") && postToolDiag.contains("写入 postfail.ipa 解密报告失败"))
+
+        // Partial batch failure must not be overwritten by subsequent successful item
+        let partialRunner = Runner(verify: {})
+        let partialToken = partialRunner.beginBatch("正在解密 IPA")!
+        let item1 = await withCheckedContinuation { continuation in
+            partialRunner.launch(URL(fileURLWithPath: "/bin/zsh"), ["-c", "printf 'error: first ipa failed\\n'; exit 5"], title: "正在解密 first.ipa", holdsCompletion: true, batchID: partialToken) {
+                continuation.resume(returning: $0)
+            }
+        }
+        precondition(!item1)
+        partialRunner.finishCompletion()
+        let item2 = await withCheckedContinuation { continuation in
+            partialRunner.launch(URL(fileURLWithPath: "/bin/zsh"), ["-c", "printf 'second ipa ok\\n'; exit 0"], title: "正在解密 second.ipa", holdsCompletion: true, batchID: partialToken) {
+                continuation.resume(returning: $0)
+            }
+        }
+        precondition(item2)
+        partialRunner.finishCompletion()
+        partialRunner.finishBatch(partialToken)
+        let partialReport = partialRunner.diagnosticReport(detail: "部分失败")
+        precondition(partialReport.contains("结果  失败") && partialReport.contains("退出码  5") && partialReport.contains("first ipa failed"))
+        precondition(partialRunner.output.contains("first ipa failed") && partialRunner.log.contains("first ipa failed"))
+        print("PASS: diagnostic result and logs preserved across cleanup, staging failure, and partial batch failure")
+
+        // 1.5.7 -> 1.5.8 local session status before & after lazy migration (including real macOS Keychain & symlink dir check)
+        let sessionStatusRoot = root.appendingPathComponent("session-status-test")
+        let migratedID = UUID(), legacyKeychainID = UUID(), legacyFileID = UUID(), missingSessionID = UUID(), symlinkSessionID = UUID()
+        let migratedDir = sessionStatusRoot.appendingPathComponent("Sessions/\(migratedID.uuidString.lowercased())")
+        let legacyFileDir = sessionStatusRoot.appendingPathComponent("Sessions/\(legacyFileID.uuidString.lowercased())")
+        let symlinkSessionDir = sessionStatusRoot.appendingPathComponent("Sessions/\(symlinkSessionID.uuidString.lowercased())")
+        try Core.privateDirectory(migratedDir)
+        try Core.privateDirectory(legacyFileDir)
+        try Data("ciphertext".utf8).write(to: migratedDir.appendingPathComponent("session-v1.enc"))
+        try Data("legacy-file-cred".utf8).write(to: legacyFileDir.appendingPathComponent("account"))
+        try fm.createSymbolicLink(at: symlinkSessionDir, withDestinationURL: migratedDir)
+        precondition(Core.localSessionStatus(accountID: migratedID, canDownload: true, fallbackStatus: "已登录", root: sessionStatusRoot, hasLegacyKeychainSession: { _ in false }) == "本地会话已保存")
+        precondition(Core.localSessionStatus(accountID: symlinkSessionID, canDownload: true, fallbackStatus: "已登录", root: sessionStatusRoot, hasLegacyKeychainSession: { _ in false }) == "无法读取本地会话状态")
+        precondition(Core.localSessionStatus(accountID: legacyKeychainID, canDownload: true, fallbackStatus: "已登录", root: sessionStatusRoot, hasLegacyKeychainSession: { $0 == legacyKeychainID }) == "旧版会话待首次使用时迁移")
+        precondition(Core.localSessionStatus(accountID: legacyFileID, canDownload: true, fallbackStatus: "已登录", root: sessionStatusRoot, hasLegacyKeychainSession: { _ in false }) == "旧版会话待首次使用时迁移")
+        precondition(Core.localSessionStatus(accountID: missingSessionID, canDownload: true, fallbackStatus: "已登录", root: sessionStatusRoot, hasLegacyKeychainSession: { _ in false }) == "未找到本地会话文件")
+        precondition(Core.localSessionStatus(accountID: migratedID, canDownload: false, fallbackStatus: "未登录", root: sessionStatusRoot, hasLegacyKeychainSession: { _ in true }) == "未登录")
+
+        let realLegacyKeychainID = UUID()
+        let legacyKCService = "ipatool-auth.service." + realLegacyKeychainID.uuidString.lowercased()
+        let legacyKCBaseQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: legacyKCService,
+            kSecAttrAccount as String: "account"
+        ]
+        precondition(!Core.hasLegacyKeychainSession(realLegacyKeychainID))
+        var legacyKCAdd = legacyKCBaseQuery
+        legacyKCAdd[kSecValueData as String] = Data("synthetic-legacy-1.5.7-account".utf8)
+        let addStatus = SecItemAdd(legacyKCAdd as CFDictionary, nil)
+        if addStatus == errSecSuccess {
+            defer { _ = SecItemDelete(legacyKCBaseQuery as CFDictionary) }
+            precondition(Core.hasLegacyKeychainSession(realLegacyKeychainID))
+            precondition(Core.localSessionStatus(accountID: realLegacyKeychainID, canDownload: true, fallbackStatus: "已登录", root: sessionStatusRoot) == "旧版会话待首次使用时迁移")
+            _ = SecItemDelete(legacyKCBaseQuery as CFDictionary)
+            precondition(!Core.hasLegacyKeychainSession(realLegacyKeychainID))
+        }
+        print("PASS: local session status distinguishes migrated encrypted session, pending 1.5.7 legacy session, and missing session")
+
+        // UpdateChecker status codes, error messages, and available state reset
+        var mockStatus = 200
+        var mockBody = Data(#"{"tag_name":"v1.6.0","draft":false,"prerelease":false}"#.utf8)
+        var mockError: Error?
+        let releaseEndpoint = URL(string: "https://api.github.com/repos/Emokui/UnfairPlay/releases/latest")!
+        let checkerInstance = UpdateChecker(fetch: { _ in
+            if let mockError { throw mockError }
+            let response = HTTPURLResponse(url: releaseEndpoint, statusCode: mockStatus, httpVersion: nil, headerFields: nil)!
+            return (mockBody, response)
+        }, versionProvider: { "1.5.8" })
+        await checkerInstance.check()
+        precondition(checkerInstance.available == "v1.6.0" && checkerInstance.message == nil)
+        mockBody = Data(#"{"tag_name":"v1.6.0","draft":true,"prerelease":false}"#.utf8)
+        await checkerInstance.check(manual: true)
+        precondition(checkerInstance.available == nil && checkerInstance.message == nil)
+        mockBody = Data(#"{"tag_name":"v1.6.1","draft":false,"prerelease":false}"#.utf8)
+        await checkerInstance.check(manual: true)
+        precondition(checkerInstance.available == "v1.6.1")
+        mockStatus = 404
+        await checkerInstance.check(manual: true)
+        precondition(checkerInstance.available == nil && checkerInstance.message == "当前尚无已发布的正式版本。")
+        mockStatus = 429
+        await checkerInstance.check(manual: true)
+        precondition(checkerInstance.message == "GitHub 更新接口请求受限，请稍后重试。")
+        mockStatus = 503
+        await checkerInstance.check(manual: true)
+        precondition(checkerInstance.message == "暂时无法获取更新（HTTP 503），请稍后重试。")
+        mockError = URLError(.notConnectedToInternet)
+        await checkerInstance.check(manual: true)
+        precondition(checkerInstance.message == "检查更新失败，请检查网络后重试。")
+        print("PASS: UpdateChecker preserves HTTP 404/429/5xx semantics and clears stale available version on draft/prerelease/404")
+
         await waitUntil { Runner.active.isEmpty }
         print("ALL REGRESSION TESTS PASSED")
     }

@@ -2,6 +2,8 @@ import Foundation
 import Combine
 
 @MainActor final class UpdateChecker: ObservableObject {
+    typealias DataFetcher = (URLRequest) async throws -> (Data, URLResponse)
+
     nonisolated static var currentVersion: String {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.0"
     }
@@ -10,6 +12,16 @@ import Combine
     @Published private(set) var checking = false
     @Published private(set) var message: String?
     private var checkedAutomatically = false
+    private let fetch: DataFetcher
+    private let versionProvider: () -> String
+
+    init(
+        fetch: @escaping DataFetcher = { try await URLSession.shared.data(for: $0) },
+        versionProvider: @escaping () -> String = { UpdateChecker.currentVersion }
+    ) {
+        self.fetch = fetch
+        self.versionProvider = versionProvider
+    }
 
     func check(manual: Bool = false) async {
         guard !checking, manual || !checkedAutomatically else { return }
@@ -17,14 +29,27 @@ import Combine
         checking = true
         message = nil
         defer { checking = false }
+        let localVersion = versionProvider()
         do {
             var request = URLRequest(url: URL(string: "https://api.github.com/repos/Emokui/UnfairPlay/releases/latest")!)
             request.timeoutInterval = 15
             request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
-            request.setValue("UnfairPlay/\(Self.currentVersion)", forHTTPHeaderField: "User-Agent")
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            request.setValue("UnfairPlay/\(localVersion)", forHTTPHeaderField: "User-Agent")
+            let (data, response) = try await fetch(request)
+            guard let http = response as? HTTPURLResponse else {
                 throw DeskError("暂时无法获取更新，请稍后重试。")
+            }
+            switch http.statusCode {
+            case 200:
+                break
+            case 404:
+                available = nil
+                message = "当前尚无已发布的正式版本。"
+                return
+            case 403, 429:
+                throw DeskError("GitHub 更新接口请求受限，请稍后重试。")
+            default:
+                throw DeskError("暂时无法获取更新（HTTP \(http.statusCode)），请稍后重试。")
             }
             struct Release: Decodable {
                 let tag: String
@@ -33,10 +58,20 @@ import Combine
                 enum CodingKeys: String, CodingKey { case tag = "tag_name", draft, prerelease }
             }
             let release = try JSONDecoder().decode(Release.self, from: data)
-            guard !release.draft, !release.prerelease else { return }
-            available = Self.isNewer(release.tag, than: Self.currentVersion) ? release.tag : nil
+            guard !release.draft, !release.prerelease else {
+                available = nil
+                return
+            }
+            available = Self.isNewer(release.tag, than: localVersion) ? release.tag : nil
         } catch {
-            if !Task.isCancelled { message = "检查更新失败，请检查网络后重试。" }
+            if Task.isCancelled || (error as? URLError)?.code == .cancelled { return }
+            if let deskError = error as? DeskError {
+                message = deskError.localizedDescription
+            } else if error is DecodingError {
+                message = "更新信息格式异常，请稍后重试。"
+            } else {
+                message = "检查更新失败，请检查网络后重试。"
+            }
         }
     }
 

@@ -90,7 +90,7 @@ extension ContentView {
             picker.allowedContentTypes = [UTType(filenameExtension: "ipa") ?? .data]
             guard picker.runModal() == .OK, let file = picker.url else { return }
             if Core.sameFile(first, file) {
-                alertText = "输出位置与原始 IPA 实际上是同一个文件。"
+                noticeText = "输出位置与原始 IPA 实际上是同一个文件。"
                 return
             }
             destination = file
@@ -104,9 +104,10 @@ extension ContentView {
 
         Task { @MainActor in
             guard let batchToken = runner.beginBatch(verifyOnly ? "正在验证 IPA" : "正在解密 IPA") else { return }
-            if !verifyOnly { completionNotice = nil }
+            completionNotice = nil
             var completed = 0
             var cancelled = false
+            var abandonedSingleSave = false
             var issues: [String] = []
             var outputs: [URL] = []
             defer { ipaBatchPosition = nil; runner.finishBatch(batchToken) }
@@ -114,6 +115,7 @@ extension ContentView {
             for (index, input) in inputs.enumerated() {
                 if runner.cancelled { cancelled = true; break }
                 if batch { ipaBatchPosition = "\(index + 1)/\(inputs.count)" }
+                runner.recordStage("正在准备 \(input.lastPathComponent)")
                 do {
                     let target = try destination.map {
                         if batch || automatic { return try unusedDecryptedTarget(for: input, in: $0) }
@@ -123,7 +125,10 @@ extension ContentView {
                     defer {
                         if let stage {
                             do { try stage.cleanup() }
-                            catch { issues.append("\(input.lastPathComponent)：临时目录清理失败。") }
+                            catch {
+                                runner.recordBatchFailure("清理 \(input.lastPathComponent) 临时目录失败", detail: error.localizedDescription)
+                                issues.append("\(input.lastPathComponent)：临时目录清理失败。")
+                            }
                         }
                         runner.finishCompletion()
                     }
@@ -152,7 +157,7 @@ extension ContentView {
                             saved = target.url
                         } else {
                             guard let file = await saveCompletedIPA(stage.ipa, destination: target, protecting: input) else {
-                                issues.append("\(input.lastPathComponent)：结果未保存。")
+                                abandonedSingleSave = true
                                 continue
                             }
                             saved = file
@@ -165,15 +170,20 @@ extension ContentView {
                             let report = try JSONSerialization.jsonObject(with: Data(contentsOf: stage.report))
                             try Core.writeJSON(report, to: reportFolder.appendingPathComponent("\(UUID().uuidString).json"))
                         } catch {
+                            runner.recordBatchFailure("写入 \(saved.lastPathComponent) 解密报告失败", detail: error.localizedDescription)
                             issues.append("\(saved.lastPathComponent)：已保存，报告写入失败。\(error.localizedDescription)")
                         }
                     } else {
                         completed += 1
                     }
                 } catch {
+                    runner.recordBatchFailure("处理 \(input.lastPathComponent) 失败", detail: error.localizedDescription)
                     issues.append("\(input.lastPathComponent)：\(error.localizedDescription)")
                 }
             }
+
+            ipaBatchPosition = nil
+            runner.finishBatch(batchToken)
 
             var known = Set(recentIPAOutputs)
             recentIPAOutputs.append(contentsOf: outputs.filter { known.insert($0).inserted })
@@ -186,8 +196,15 @@ extension ContentView {
                     if issues.count > 4 { summary += "\n\n另有 \(issues.count - 4) 条问题。" }
                 }
                 alertText = summary
+            } else if abandonedSingleSave {
+                runner.title = "已放弃保存结果"
             } else if verifyOnly {
                 showCompletion(completed == 1 ? "IPA 验证通过" : "已验证 \(completed) 份 IPA")
+            } else {
+                showCompletion(
+                    completed == 1 ? "IPA 已解密保存" : "已解密保存 \(completed) 份 IPA",
+                    detail: outputs.count == 1 ? outputs.first?.lastPathComponent : nil
+                )
             }
         }
     }
